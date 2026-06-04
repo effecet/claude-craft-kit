@@ -124,28 +124,44 @@ def _log_friction(label: str, prompt: str, msg_count: int) -> None:
 
 
 def _desktop_notify(title: str, message: str, urgency: str = "normal") -> None:
-    """Cross-platform desktop notification. Silent no-op if no daemon available."""
+    """Best-effort cross-platform desktop notification. Always a silent no-op if
+    no notifier is available — it never raises, so a missing tool can't break the
+    hook.
+
+    Backend per OS (with install hints):
+      macOS   : `terminal-notifier` if installed (`brew install terminal-notifier`),
+                otherwise the built-in `osascript` — so macOS works with zero install.
+      Linux   : `notify-send` (`apt install libnotify-bin` / `dnf install libnotify`).
+      Windows : PowerShell + the BurntToast module (`Install-Module BurntToast`).
+                If BurntToast isn't present the call no-ops; swap in your own
+                toast command here if you prefer a different mechanism.
+    """
+    system = platform.system()
     try:
-        if platform.system() == "Darwin":
-            cmd = [
-                "terminal-notifier",
-                "-title",
-                title,
-                "-message",
-                message,
-                "-sound",
-                "Pop",
-            ]
-        else:
-            cmd = [
-                "notify-send",
-                title,
-                message,
-                "--icon=dialog-information",
-                f"--urgency={urgency}",
-            ]
-        if shutil.which(cmd[0]):
-            subprocess.run(cmd, timeout=5, capture_output=True)
+        if system == "Darwin":
+            if shutil.which("terminal-notifier"):
+                subprocess.run(
+                    ["terminal-notifier", "-title", title, "-message", message, "-sound", "Pop"],
+                    timeout=5, capture_output=True,
+                )
+            elif shutil.which("osascript"):  # built-in fallback, no install needed
+                script = f"display notification {json.dumps(message)} with title {json.dumps(title)}"
+                subprocess.run(["osascript", "-e", script], timeout=5, capture_output=True)
+        elif system == "Windows":
+            if shutil.which("powershell"):
+                def _ps(s: str) -> str:  # PowerShell single-quote escaping
+                    return "'" + s.replace("'", "''") + "'"
+                subprocess.run(
+                    ["powershell", "-NoProfile", "-Command",
+                     f"New-BurntToastNotification -Text {_ps(title)}, {_ps(message)}"],
+                    timeout=5, capture_output=True,
+                )
+        else:  # Linux / other
+            if shutil.which("notify-send"):
+                subprocess.run(
+                    ["notify-send", title, message, "--icon=dialog-information", f"--urgency={urgency}"],
+                    timeout=5, capture_output=True,
+                )
     except Exception:
         pass
 

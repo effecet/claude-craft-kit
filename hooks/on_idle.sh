@@ -90,11 +90,21 @@ with open('$STATE_FILE', 'w') as f:
 
 # ── Desktop notification ──────────────────────────────────────────────────────
 # Surfaces outside the terminal so you notice even when Claude Code is in bg.
+# Deps: macOS uses `terminal-notifier` (brew install terminal-notifier) and falls
+# back to the built-in `osascript` if it's absent — so macOS needs no install.
+# Linux uses `notify-send` (apt install libnotify-bin). Every call is best-effort
+# (`|| true`), so a missing tool never aborts the hook.
 
+MSG="You have been idle for 1 hour. Open Claude Code to wrap up."
 if [[ "$(uname)" == "Darwin" ]]; then
-  terminal-notifier -title "Claude Code" -subtitle "Session idle" -message "You have been idle for 1 hour. Open Claude Code to wrap up." -sound default 2>/dev/null || true
+  if command -v terminal-notifier >/dev/null 2>&1; then
+    terminal-notifier -title "Claude Code" -subtitle "Session idle" -message "$MSG" -sound default 2>/dev/null || true
+  elif command -v osascript >/dev/null 2>&1; then
+    osascript -e "display notification \"$MSG\" with title \"Claude Code\"" 2>/dev/null || true
+  fi
 else
-  notify-send "Claude Code" "You have been idle for 1 hour. Open Claude Code to wrap up." --icon=dialog-information --urgency=normal 2>/dev/null || true
+  command -v notify-send >/dev/null 2>&1 && \
+    notify-send "Claude Code" "$MSG" --icon=dialog-information --urgency=normal 2>/dev/null || true
 fi
 
 log "on_idle complete."
