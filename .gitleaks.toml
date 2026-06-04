@@ -1,0 +1,17 @@
+# gitleaks config for claude-craft-kit
+# Extends the default ruleset; add allowlists for known-safe placeholders.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Template placeholders — not real secrets"
+regexes = [
+  '''<your-[a-z-]+>''',
+  '''<region>''',
+  '''aws-0-<region>\.pooler\.supabase\.com''',
+  '''DATABASE_URL=postgresql://postgres\.<project-ref>''',
+]
+paths = [
+  '''README\.md''',
+  '''docs/.*\.md''',
+]
