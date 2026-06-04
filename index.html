@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>claude-craft-kit · the workflow, animated</title>
+<style>
+  :root{
+    --bg:#0c0a1a; --panel:#150f2e; --node:#1c1838; --node-stroke:#3a3360;
+    --text:#fff; --muted:#9b95c0; --accent:#d97757; --accent2:#5ddf7a;
+    --edge:#3a3360; --edge-hot:#d97757; --particle:#ffd23f; --glow:0;
+    --skip:#6c7bff; --light:#5ddf7a; --full:#ff5d8f; --grid:rgba(255,255,255,.03);
+    --font:'SF Mono',ui-monospace,'Cascadia Code',Menlo,Consolas,monospace;
+  }
+  /* ---- NEON ---- */
+  body.neon{
+    --bg:#070512; --panel:#0e0a24; --node:#11091f; --node-stroke:#2b1f55;
+    --text:#eafcff; --muted:#7fd6e6; --accent:#3fd0ff; --accent2:#ff5d8f;
+    --edge:#241a4a; --edge-hot:#ff5d8f; --particle:#3fd0ff; --glow:1;
+    --skip:#6c7bff; --light:#5ddf7a; --full:#ff5d8f; --grid:rgba(120,80,255,.05);
+  }
+  /* ---- BLUEPRINT ---- */
+  body.blueprint{
+    --bg:#eef3f8; --panel:#ffffff; --node:#ffffff; --node-stroke:#9fc0dd;
+    --text:#163049; --muted:#5a778f; --accent:#1f7a8c; --accent2:#2a9d6a;
+    --edge:#b8cfe0; --edge-hot:#1f7a8c; --particle:#1f7a8c; --glow:0;
+    --skip:#3f6fd0; --light:#2a9d6a; --full:#d0533f; --grid:rgba(31,122,140,.06);
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%}
+  body{
+    background:
+      linear-gradient(var(--grid) 1px,transparent 1px) 0 0/26px 26px,
+      linear-gradient(90deg,var(--grid) 1px,transparent 1px) 0 0/26px 26px,
+      radial-gradient(120% 100% at 30% 0%, color-mix(in srgb,var(--accent) 10%,var(--bg)) 0%, var(--bg) 60%);
+    color:var(--text); font-family:var(--font);
+    display:flex; flex-direction:column; align-items:center; min-height:100vh; padding:20px 14px 40px;
+    transition:background .4s,color .4s;
+  }
+  .wrap{width:100%;max-width:880px}
+  header{display:flex;justify-content:space-between;align-items:flex-end;flex-wrap:wrap;gap:10px;margin-bottom:10px}
+  h1{font-size:21px;margin:0;letter-spacing:.5px}
+  h1 .k{color:var(--accent)}
+  .sub{font-size:12.5px;color:var(--muted);margin-top:3px}
+  a.repo{color:var(--accent);text-decoration:none;font-size:12.5px;border:1px solid var(--node-stroke);padding:6px 11px;border-radius:8px}
+  a.repo:hover{border-color:var(--accent)}
+  .bar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:12px 0;font-size:13px}
+  .btn{font-family:inherit;cursor:pointer;border:1px solid var(--node-stroke);background:var(--node);color:var(--text);
+       padding:7px 13px;border-radius:9px;font-size:13px;transition:.15s}
+  .btn:hover{border-color:var(--accent)}
+  .btn.on{background:var(--accent);color:var(--bg);border-color:var(--accent);font-weight:700}
+  .themes{display:flex;gap:6px;margin-left:auto}
+  .speed{display:flex;align-items:center;gap:7px;color:var(--muted)}
+  .speed input{accent-color:var(--accent)}
+  .stage{display:flex;gap:16px;align-items:flex-start;flex-wrap:wrap}
+  svg{width:440px;max-width:100%;height:auto;flex:1 1 420px;touch-action:manipulation}
+  .panel{flex:1 1 280px;min-width:240px;background:var(--panel);border:1px solid var(--node-stroke);
+         border-radius:14px;padding:16px 16px 18px;min-height:200px}
+  .panel .tag{font-size:11px;color:var(--accent);text-transform:uppercase;letter-spacing:1.5px}
+  .panel h2{font-size:17px;margin:6px 0 8px}
+  .panel p{font-size:13.5px;line-height:1.6;color:var(--muted);margin:0 0 10px}
+  .panel code{background:var(--node);padding:1px 5px;border-radius:5px;color:var(--text);font-size:12.5px}
+  .hint{font-size:11.5px;color:var(--muted);margin-top:14px;opacity:.8}
+  /* svg node styling */
+  .node rect,.node polygon,.node .pill{fill:var(--node);stroke:var(--node-stroke);stroke-width:2;cursor:pointer;
+        transition:fill .25s,stroke .25s,filter .25s}
+  .node text{fill:var(--text);font-family:var(--font);cursor:pointer;dominant-baseline:middle;text-anchor:middle}
+  .node .lbl{font-size:13px;font-weight:700}
+  .node .file{font-size:9.5px;fill:var(--muted)}
+  .node.active rect,.node.active polygon,.node.active .pill{fill:color-mix(in srgb,var(--accent) 30%,var(--node));stroke:var(--accent)}
+  body.neon .node.active rect,body.neon .node.active polygon{filter:drop-shadow(0 0 8px var(--accent))}
+  .guard{font-size:9px;fill:var(--muted);text-anchor:middle;transition:fill .2s}
+  .node.active .guard{fill:var(--text)}
+  .gpulse{fill:var(--accent2)!important}
+  .edge{fill:none;stroke:var(--edge);stroke-width:2.5}
+  .edge.hot{stroke:var(--edge-hot);stroke-dasharray:6 6;animation:flow .5s linear infinite}
+  @keyframes flow{to{stroke-dashoffset:-12}}
+  #particle{fill:var(--particle)}
+  body.neon #particle{filter:drop-shadow(0 0 6px var(--particle))}
+  .tier{font-size:11px;fill:var(--muted);text-anchor:start;font-weight:700;transition:.2s;opacity:.45}
+  .tier.on{opacity:1}
+  #tier-skip.on{fill:var(--skip)} #tier-light.on{fill:var(--light)} #tier-full.on{fill:var(--full)}
+  .arrowhead{fill:var(--edge)}
+</style>
+</head>
+<body class="terminal">
+<div class="wrap">
+  <header>
+    <div>
+      <h1><span class="k">claude-craft-kit</span> · the workflow, animated</h1>
+      <div class="sub">A "session" flows through the hook lifecycle — guards, the validation gate, the exit gate. Click any node.</div>
+    </div>
+    <a class="repo" href="https://github.com/effecet/claude-craft-kit" target="_blank" rel="noopener">↗ repo</a>
+  </header>
+
+  <div class="bar">
+    <button class="btn on" id="playBtn">⏸ Pause</button>
+    <div class="speed"><span>speed</span><input type="range" id="speed" min="0.5" max="3" step="0.1" value="0.7"/><span id="speedLbl">0.7×</span></div>
+    <div class="themes">
+      <button class="btn on" data-theme="terminal">Terminal</button>
+      <button class="btn" data-theme="neon">Neon</button>
+      <button class="btn" data-theme="blueprint">Blueprint</button>
+    </div>
+  </div>
+
+  <div class="stage">
+    <svg id="flow" viewBox="0 0 440 780" role="img" aria-label="Claude Code workflow lifecycle">
+      <defs>
+        <marker id="arrow" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path class="arrowhead" d="M0,0 L6,3 L0,6 Z"/>
+        </marker>
+      </defs>
+      <!-- edges -->
+      <path class="edge" id="e_start"        d="M220,76 L220,138"  marker-end="url(#arrow)"/>
+      <path class="edge" id="e_p2w"          d="M220,186 L220,248" marker-end="url(#arrow)"/>
+      <path class="edge" id="e_w2g"          d="M220,294 L220,358" marker-end="url(#arrow)"/>
+      <path class="edge" id="e_g2gate"       d="M220,426 L220,466" marker-end="url(#arrow)"/>
+      <path class="edge" id="e_gate2prompt"  d="M150,505 C 56,492 52,206 138,165" marker-end="url(#arrow)"/>
+      <path class="edge" id="e_gate2stop"    d="M220,544 L220,585" marker-end="url(#arrow)"/>
+      <path class="edge" id="e_stop2end"     d="M220,629 L220,670" marker-end="url(#arrow)"/>
+
+      <!-- tier labels -->
+      <text class="tier" id="tier-skip"  x="300" y="486">Skip</text>
+      <text class="tier" id="tier-light" x="300" y="507">Light · 2 reviewers</text>
+      <text class="tier" id="tier-full"  x="300" y="528">Full · 6 reviewers</text>
+      <text class="tier" id="loopLbl" transform="rotate(-90 26 320)" x="26" y="320" text-anchor="middle" style="fill:var(--muted);opacity:.5;font-size:10px">↺ loop · more work</text>
+
+      <!-- nodes -->
+      <g class="node" id="node-start" data-key="start">
+        <rect x="140" y="34" width="160" height="42" rx="10"/>
+        <text class="lbl" x="220" y="50">SessionStart</text>
+        <text class="file" x="220" y="64">session_start.py</text>
+      </g>
+      <g class="node" id="node-prompt" data-key="prompt">
+        <rect x="140" y="142" width="160" height="44" rx="10"/>
+        <text class="lbl" x="220" y="158">UserPromptSubmit</text>
+        <text class="file" x="220" y="172">track.py · consume_prompt.py</text>
+      </g>
+      <g class="node" id="node-work" data-key="work">
+        <rect x="140" y="250" width="160" height="44" rx="10"/>
+        <text class="lbl" x="220" y="266">Claude works</text>
+        <text class="file" x="220" y="280">plan → implement → test</text>
+      </g>
+      <g class="node" id="node-guards" data-key="guards">
+        <rect x="92" y="360" width="256" height="66" rx="10"/>
+        <text class="lbl" x="220" y="376">PreToolUse guards</text>
+        <text class="guard" id="g0" x="125" y="398">gitleaks</text>
+        <text class="guard" id="g1" x="200" y="398">pr_scan</text>
+        <text class="guard" id="g2" x="265" y="398">ruff</text>
+        <text class="guard" id="g3" x="140" y="414">prd_guard</text>
+        <text class="guard" id="g4" x="250" y="414">memory_name</text>
+      </g>
+      <g class="node" id="node-gate" data-key="gate">
+        <polygon points="220,468 292,505 220,542 148,505"/>
+        <text class="lbl" x="220" y="500">Validation</text>
+        <text class="file" x="220" y="514">validate_tier.py</text>
+      </g>
+      <g class="node" id="node-stop" data-key="stop">
+        <rect x="140" y="585" width="160" height="44" rx="10"/>
+        <text class="lbl" x="220" y="601">Stop gate</text>
+        <text class="file" x="220" y="615">stop_gate.py · wrap-up</text>
+      </g>
+      <g class="node" id="node-end" data-key="end">
+        <rect class="pill" x="160" y="672" width="120" height="34" rx="17"/>
+        <text class="lbl" x="220" y="689">Session ends</text>
+      </g>
+
+      <circle id="particle" cx="220" cy="55" r="6"/>
+    </svg>
+
+    <div class="panel" id="panel">
+      <div class="tag" id="p-tag">the loop</div>
+      <h2 id="p-title">Watch a session flow</h2>
+      <p id="p-body">A session enters at <b>SessionStart</b>, loops through prompts, the safety <b>guards</b>, and the <b>validation gate</b> (which picks a review tier), then exits through the <b>Stop gate</b>. Click any node to read what it does.</p>
+      <div class="hint">Auto-playing · click nodes to inspect · ⏸ to pause · drag speed</div>
+    </div>
+  </div>
+</div>
+
+<script>
+const INFO = {
+  start:  ["SessionStart hook","SessionStart","<code>session_start.py</code> — initializes or resumes your session state, prints git context, and surfaces any open specs so you pick up where you left off."],
+  prompt: ["UserPromptSubmit hooks","Per message","<code>track.py</code> + <code>consume_prompt.py</code> — count messages, report token usage, detect friction & “goodbye” phrases (to offer wrap-up), and surface pending prompts."],
+  work:   ["the work","Claude works","Claude plans → implements → tests the change. The hooks don't get in the way here — they bracket the work on either side."],
+  guards: ["PreToolUse guards","Safety guards","Fire <b>before</b> each tool call and can block it: <code>gitleaks</code> & <code>pr_security_scan</code> (no leaked secrets), <code>ruff_workflow</code> (lint before commit), <code>prd_guard</code> (prod-path warning), <code>memory_name_guard</code> (naming convention)."],
+  gate:   ["the gate","Tiered validation","<code>validate_tier.py</code> reads the diff and picks a review tier instead of eyeballing it: <b>Skip</b> (docs/config), <b>Light</b> (&lt;30 LOC → 2 reviewers), <b>Full</b> (sensitive paths / features → 6 reviewers)."],
+  stop:   ["Stop hook","Exit gate","<code>stop_gate.py</code> blocks a clean exit until a wrap-up runs on a substantial session — so learnings and commits aren't lost on the way out."],
+  end:    ["done","Session ends","Learnings captured, work committed. The loop is closed — and the next session resumes the state this one left behind."],
+};
+const svg=document.getElementById('flow');
+const particle=document.getElementById('particle');
+const panel={tag:document.getElementById('p-tag'),title:document.getElementById('p-title'),body:document.getElementById('p-body')};
+function showInfo(k){const i=INFO[k];if(!i)return;panel.tag.textContent=i[0];panel.title.textContent=i[1];panel.body.innerHTML=i[2];}
+
+function nodeEl(k){return document.getElementById('node-'+k);}
+function activate(k){
+  document.querySelectorAll('.node').forEach(n=>n.classList.remove('active'));
+  const n=nodeEl(k); if(n)n.classList.add('active');
+  showInfo(k);
+}
+// guard chip flicker
+let gi=0,gt=null;
+function pulseGuards(on){
+  if(on){gt=setInterval(()=>{for(let i=0;i<5;i++)document.getElementById('g'+i).classList.toggle('gpulse',i===gi%5);gi++;},120);}
+  else{clearInterval(gt);for(let i=0;i<5;i++)document.getElementById('g'+i).classList.remove('gpulse');}
+}
+const TIERS=['skip','light','light','full','full','light'];
+function setTier(t){['skip','light','full'].forEach(x=>document.getElementById('tier-'+x).classList.toggle('on',x===t));}
+
+// ---- route state machine ----
+let queue=[];
+function refill(){
+  setTier(null);
+  const loops=2+Math.floor(Math.random()*2);
+  queue.push({edge:'e_start',to:'prompt',first:true});
+  for(let i=0;i<loops;i++){
+    queue.push({edge:'e_p2w',to:'work'});
+    queue.push({edge:'e_w2g',to:'guards'});
+    queue.push({edge:'e_g2gate',to:'gate',tier:TIERS[Math.floor(Math.random()*TIERS.length)]});
+    if(i<loops-1) queue.push({edge:'e_gate2prompt',to:'prompt'});
+  }
+  queue.push({edge:'e_gate2stop',to:'stop'});
+  queue.push({edge:'e_stop2end',to:'end',last:true});
+}
+
+let seg=null,pathEl=null,segLen=0,dist=0,pauseUntil=0;
+function startSeg(){
+  if(!queue.length){activate('start');refill();}
+  seg=queue.shift();
+  if(seg.first) activate('start');
+  pathEl=document.getElementById(seg.edge);
+  segLen=pathEl.getTotalLength(); dist=0;
+  document.querySelectorAll('.edge').forEach(e=>e.classList.remove('hot'));
+  pathEl.classList.add('hot');
+  pulseGuards(false);
+}
+function arrive(s){
+  pathEl.classList.remove('hot');
+  activate(s.to);
+  if(s.tier) setTier(s.tier);
+  if(s.to==='guards') pulseGuards(true);
+  pauseUntil = performance.now() + (s.to==='guards'?700:s.to==='gate'?650:s.last?1100:380);
+  seg=null;
+}
+
+let running=true, speed=0.7, last=0, raf=null;
+function frame(ts){
+  if(!last)last=ts;
+  let dt=Math.min(60,ts-last); last=ts;
+  if(running && ts>=pauseUntil){
+    if(!seg) startSeg();
+    if(seg){
+      dist += dt*0.13*speed;
+      const d=Math.min(dist,segLen);
+      const p=pathEl.getPointAtLength(d);
+      particle.setAttribute('cx',p.x); particle.setAttribute('cy',p.y);
+      if(dist>=segLen){ pulseGuards(false); arrive(seg); }
+    }
+  }
+  raf=requestAnimationFrame(frame);
+}
+refill(); startSeg(); raf=requestAnimationFrame(frame);
+
+// ---- controls ----
+const playBtn=document.getElementById('playBtn');
+playBtn.onclick=()=>{running=!running;playBtn.textContent=running?'⏸ Pause':'▶ Play';playBtn.classList.toggle('on',running);};
+const spd=document.getElementById('speed'),spdL=document.getElementById('speedLbl');
+spd.oninput=e=>{speed=+e.target.value;spdL.textContent=speed.toFixed(1)+'×';};
+document.querySelectorAll('.themes .btn').forEach(b=>{
+  b.onclick=()=>{document.body.className=b.dataset.theme;
+    document.querySelectorAll('.themes .btn').forEach(x=>x.classList.toggle('on',x===b));};
+});
+document.querySelectorAll('.node').forEach(n=>{
+  n.addEventListener('click',()=>{showInfo(n.dataset.key);
+    document.querySelectorAll('.node').forEach(x=>x.classList.remove('active'));n.classList.add('active');});
+});
+</script>
+</body>
+</html>

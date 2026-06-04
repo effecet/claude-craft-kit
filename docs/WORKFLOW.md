@@ -4,6 +4,9 @@ This is the lifecycle the hooks + rules enforce. The goal: turn a free-form agen
 session into a disciplined loop with safety guards on the way in, a review gate
 in the middle, and a wrap-up gate on the way out.
 
+> ▶ **[Interactive version →](https://effecet.github.io/claude-craft-kit/)** — watch a
+> session flow through these stages (auto-plays; click any node).
+
 ## Lifecycle stages
 
 ```mermaid

@@ -1,5 +1,6 @@
 # 🛠️ claude-craft-kit
 
+[![▶ Live demo](https://img.shields.io/badge/▶_Live_demo-effecet.github.io-d97757)](https://effecet.github.io/claude-craft-kit/)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![Claude Code](https://img.shields.io/badge/Claude%20Code-hooks%20%2B%20rules-d97757)](https://docs.claude.com/en/docs/claude-code)
 [![hooks](https://img.shields.io/badge/hooks-16-5ddf7a)](hooks/)
@@ -17,6 +18,8 @@ no dependencies beyond Python 3 + bash. An optional memory backend is supported
 but **off by default**.
 
 ## The lifecycle
+
+**▶ [See it animated →](https://effecet.github.io/claude-craft-kit/)** — an interactive, click-through version of the flow below (auto-plays a session through the hooks).
 
 ```mermaid
 flowchart TD
@@ -96,6 +99,7 @@ Nothing phones home; the brain-coupled features stay dormant until you opt in.
 ```
 claude-craft-kit/
 ├── README.md
+├── index.html                  # interactive animated lifecycle (the Pages site)
 ├── LICENSE                     # MIT
 ├── Makefile                    # install / syntax / lint / scan
 ├── CLAUDE.example.md           # generified global-instructions skeleton
