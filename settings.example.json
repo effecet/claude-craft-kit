@@ -2,7 +2,10 @@
   "_comment": "Example Claude Code hook wiring for claude-craft-kit. Copy the hooks block into your ~/.claude/settings.json and adjust paths if your CLAUDE_DIR differs. Brain-coupled hooks are listed but inert until BRAIN_ENABLED=true (see config.example.sh).",
   "hooks": {
     "SessionStart": [
-      { "hooks": [ { "type": "command", "command": "python3 ~/.claude/hooks/session_start.py" } ] }
+      { "hooks": [
+        { "type": "command", "command": "python3 ~/.claude/hooks/session_start.py" },
+        { "type": "command", "command": "python3 ~/.claude/hooks/mcp_restore_guard.py" }
+      ] }
     ],
     "UserPromptSubmit": [
       { "hooks": [

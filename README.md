@@ -3,7 +3,7 @@
 [![▶ Live demo](https://img.shields.io/badge/▶_Live_demo-effecet.github.io-d97757)](https://effecet.github.io/claude-craft-kit/)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![Claude Code](https://img.shields.io/badge/Claude%20Code-hooks%20%2B%20rules-d97757)](https://docs.claude.com/en/docs/claude-code)
-[![hooks](https://img.shields.io/badge/hooks-16-5ddf7a)](hooks/)
+[![hooks](https://img.shields.io/badge/hooks-17-5ddf7a)](hooks/)
 [![Python](https://img.shields.io/badge/python-3.10%2B-3776ab?logo=python&logoColor=white)](#)
 [![shell](https://img.shields.io/badge/shell-bash-4eaa25?logo=gnubash&logoColor=white)](#)
 
@@ -54,6 +54,7 @@ See **[docs/WORKFLOW.md](docs/WORKFLOW.md)** for the full walkthrough and the va
 | Stage | Hook | Does |
 |---|---|---|
 | SessionStart | `session_start.py` | Init/resume session state, git context, surface open specs |
+| SessionStart | `mcp_restore_guard.py` | Self-heal: re-register local stdio MCP servers that got dropped from `~/.claude.json` (opt-in via `mcp-restore.json`) |
 | UserPromptSubmit | `track.py`, `consume_prompt.py` | Message counting, token report, friction/goodbye detection, pending prompts |
 | PreToolUse | `gitleaks_guard.sh`, `pr_security_scan.sh` | Block commits/PRs that leak secrets |
 | PreToolUse | `prd_guard.sh` | Warn before editing prod-looking paths |
@@ -105,11 +106,13 @@ claude-craft-kit/
 ├── CLAUDE.example.md           # generified global-instructions skeleton
 ├── config.example.sh           # env config (paths, BRAIN_ENABLED, backend)
 ├── settings.example.json       # Claude Code hook wiring
+├── mcp-restore.example.json    # example: local MCP servers to self-heal on SessionStart
 ├── .gitleaks.toml              # secret-scan config
 ├── docs/
 │   └── WORKFLOW.md             # the full lifecycle + validation-tier rules
 ├── hooks/
 │   ├── session_start.py        # SessionStart: state, git context, specs
+│   ├── mcp_restore_guard.py    # SessionStart: self-heal missing local MCP servers
 │   ├── track.py                # UserPromptSubmit: counting, tokens, friction
 │   ├── consume_prompt.py       # UserPromptSubmit: surface pending prompts
 │   ├── validate_tier.py        # the tiered validation gate

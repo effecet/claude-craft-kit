@@ -1,0 +1,23 @@
+[
+  {
+    "_comment": "Copy this to ~/.claude/mcp-restore.json (or set MCP_RESTORE_CONFIG) and list YOUR local stdio MCP servers. mcp_restore_guard.py re-registers any that go missing on SessionStart. Replace <abs-path> with real absolute paths. Inert until this file exists.",
+
+    "name": "memory-persistor",
+    "scope": "user",
+    "env": {
+      "DOTENV_CONFIG_PATH": "<abs-path>/memory-persistor/.env.supabase",
+      "CLAUDE_DIR": "~/.claude"
+    },
+    "command": [
+      "node",
+      "--import",
+      "file://<abs-path>/memory-persistor/node_modules/tsx/dist/loader.mjs",
+      "<abs-path>/memory-persistor/src/mcp-server.ts"
+    ]
+  },
+  {
+    "name": "my-python-mcp",
+    "scope": "user",
+    "command": ["python3", "<abs-path>/my-mcp/server.py"]
+  }
+]
