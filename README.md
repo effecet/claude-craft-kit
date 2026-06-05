@@ -1,6 +1,7 @@
 # 🛠️ claude-craft-kit
 
 [![▶ Live demo](https://img.shields.io/badge/▶_Live_demo-effecet.github.io-d97757)](https://effecet.github.io/claude-craft-kit/)
+[![ci](https://github.com/effecet/claude-craft-kit/actions/workflows/ci.yml/badge.svg)](https://github.com/effecet/claude-craft-kit/actions/workflows/ci.yml)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![Claude Code](https://img.shields.io/badge/Claude%20Code-hooks%20%2B%20rules-d97757)](https://docs.claude.com/en/docs/claude-code)
 [![hooks](https://img.shields.io/badge/hooks-17-5ddf7a)](hooks/)
@@ -108,6 +109,8 @@ claude-craft-kit/
 ├── settings.example.json       # Claude Code hook wiring
 ├── mcp-restore.example.json    # example: local MCP servers to self-heal on SessionStart
 ├── .gitleaks.toml              # secret-scan config
+├── ruff.toml                   # lint config
+├── .github/workflows/ci.yml    # CI: ruff · shellcheck · syntax · pytest
 ├── docs/
 │   └── WORKFLOW.md             # the full lifecycle + validation-tier rules
 ├── hooks/
@@ -129,7 +132,8 @@ claude-craft-kit/
 │   └── optional/               # backend-coupled, BRAIN_ENABLED=false by default
 │       ├── proactive_recall.py # surface relevant memories per prompt
 │       └── backup_hook.py      # generic git backup of your config
-└── rules/                      # the 10 behavior rules
+├── rules/                      # the 10 behavior rules
+└── tests/                      # hook unit tests (pytest)
 ```
 
 ## License

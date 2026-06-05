@@ -1,0 +1,5 @@
+# Lint config for claude-craft-kit.
+# E741 (ambiguous variable name 'l') is an accepted nit in short hook
+# comprehensions — these are small private-harness scripts, not a library API.
+[lint]
+ignore = ["E741"]
