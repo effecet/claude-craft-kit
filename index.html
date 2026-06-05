@@ -95,12 +95,6 @@
 
   <div class="bar">
     <button class="btn on" id="playBtn">⏸ Pause</button>
-    <div class="speed"><span>speed</span><input type="range" id="speed" min="0.5" max="3" step="0.1" value="0.7"/><span id="speedLbl">0.7×</span></div>
-    <div class="themes">
-      <button class="btn on" data-theme="terminal">Terminal</button>
-      <button class="btn" data-theme="neon">Neon</button>
-      <button class="btn" data-theme="blueprint">Blueprint</button>
-    </div>
   </div>
 
   <div class="stage">
@@ -264,12 +258,6 @@ refill(); startSeg(); raf=requestAnimationFrame(frame);
 // ---- controls ----
 const playBtn=document.getElementById('playBtn');
 playBtn.onclick=()=>{running=!running;playBtn.textContent=running?'⏸ Pause':'▶ Play';playBtn.classList.toggle('on',running);};
-const spd=document.getElementById('speed'),spdL=document.getElementById('speedLbl');
-spd.oninput=e=>{speed=+e.target.value;spdL.textContent=speed.toFixed(1)+'×';};
-document.querySelectorAll('.themes .btn').forEach(b=>{
-  b.onclick=()=>{document.body.className=b.dataset.theme;
-    document.querySelectorAll('.themes .btn').forEach(x=>x.classList.toggle('on',x===b));};
-});
 document.querySelectorAll('.node').forEach(n=>{
   n.addEventListener('click',()=>{showInfo(n.dataset.key);
     document.querySelectorAll('.node').forEach(x=>x.classList.remove('active'));n.classList.add('active');});
