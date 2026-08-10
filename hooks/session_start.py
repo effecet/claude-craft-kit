@@ -11,14 +11,17 @@ Responsibilities:
 
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
 import time
+import urllib.parse
 from datetime import UTC, datetime
 from pathlib import Path
 
 from _state import make_fresh_state
+from common import resolve_connection_string
 
 CLAUDE_DIR = Path(os.environ.get("CLAUDE_DIR", str(Path.home() / ".claude")))
 STATE_FILE = CLAUDE_DIR / "session/state.json"
@@ -28,6 +31,30 @@ LEARNINGS = CLAUDE_DIR / "LEARNINGS.md"
 SPEC_AUDIT = CLAUDE_DIR / "hooks/spec_audit.py"
 
 MACHINE_ID = socket.gethostname().split(".")[0]  # short hostname for commit tags
+
+PENDING_BRIEF_LIMIT = 10  # mirrors PENDING_BRIEF_LIMIT in the backend's config
+PENDING_TIMEOUT_S = 5  # session start must not stall on a slow connection
+
+# rf-string (not f-string): PENDING_BRIEF_LIMIT still interpolates, but the
+# E'\t' / E'\n' escapes below must reach Postgres as the literal two-char
+# sequences — a plain f-string would have Python collapse them into real
+# tab/newline bytes before the query text is even built.
+#
+# category is deliberately NOT selected: pending_section() only ever renders
+# priority + title (see the `- [{priority}] {title}` line below), so a
+# category column would be dead weight in every row shipped over the wire.
+# If a future brief wants to show category, add it back here AND widen the
+# split/index logic below in lockstep — they must agree on column count.
+PENDING_SQL = rf"""
+SELECT COUNT(*) OVER () AS total_open,
+       priority,
+       replace(replace(title, E'\t', ' '), E'\n', ' ') AS title
+FROM pending
+WHERE status = 'open'
+ORDER BY CASE priority WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END,
+         created_at DESC
+LIMIT {PENDING_BRIEF_LIMIT};
+"""
 
 # When false (default), all calls into an optional private "memory brain"
 # (git auto-sync, memory decay, remote connectivity checks) are skipped.
@@ -587,6 +614,152 @@ def _open_specs_summary() -> str:
         return ""
 
 
+def _pending_from_file() -> str | None:
+    """Fallback: a plain-markdown pending.md, if one exists.
+
+    Strips the file's own single-`#` preamble lines but keeps `##` entry
+    headers — the documented per-entry format is `## [YYYY-MM-DD] <title>`,
+    so a bare `startswith("#")` filter would silently drop every entry's
+    title and leave only orphaned body text.
+    """
+    if not PENDING_FILE.exists():
+        return None
+    content = PENDING_FILE.read_text().strip()
+    lines = [
+        l for l in content.splitlines() if not l.startswith("#") or l.startswith("##")
+    ]
+    content = "\n".join(lines).strip()
+    return f"## Pending\n{content}\n" if content else None
+
+
+def _render_pending_rows(stdout: str) -> str:
+    """Format psql's tab-separated rows into the brief's Pending section."""
+    rows = [r for r in stdout.strip().splitlines() if r.strip()]
+    if not rows:
+        return "## Pending\nNone.\n"
+
+    # total_open is column 0 — positionally safe even if a title (column 2,
+    # the last field) still carries a stray tab: a bounded split(maxsplit=2)
+    # folds any residual tabs into the title text instead of shifting the
+    # earlier columns.
+    total = rows[0].split("\t", 2)[0]
+    lines = []
+    for row in rows:
+        parts = row.split("\t", 2)
+        if len(parts) >= 3:
+            lines.append(f"- [{parts[1]}] {parts[2]}")
+
+    header = f"## Pending ({total} open, showing {len(lines)})"
+    return header + "\n" + "\n".join(lines) + "\n"
+
+
+def _psql_env(conn: str) -> dict[str, str] | None:
+    """Translate a Postgres URL into PG* environment variables.
+
+    The connection string is deliberately NOT passed as an argv element:
+    argv is world-readable via `ps`, and — more sharply — it is embedded in
+    `subprocess.TimeoutExpired`'s string form, so a routine 5-second timeout
+    would print the password into the hook's stderr. Returns None if the URL
+    can't be parsed, so the caller falls back rather than guessing.
+    """
+    parsed = urllib.parse.urlsplit(conn)
+    if not parsed.hostname:
+        return None
+
+    # Drop every inherited PG* variable before setting our own. Two reasons:
+    # an ambient PGHOSTADDR outranks PGHOST and would silently point psql at a
+    # different server than the URL names, and a stale PGDATABASE/PGUSER would
+    # fill in any component this URL happens to omit. PGSERVICE and PGPASSFILE
+    # can likewise redirect the whole connection.
+    env = {k: v for k, v in os.environ.items() if not k.startswith("PG")}
+
+    env["PGHOST"] = parsed.hostname
+    if parsed.port:
+        env["PGPORT"] = str(parsed.port)
+    if parsed.username:
+        env["PGUSER"] = urllib.parse.unquote(parsed.username)
+    if parsed.password:
+        env["PGPASSWORD"] = urllib.parse.unquote(parsed.password)
+    database = parsed.path.lstrip("/")
+    if database:
+        env["PGDATABASE"] = urllib.parse.unquote(database)
+    sslmode = urllib.parse.parse_qs(parsed.query).get("sslmode")
+    if sslmode:
+        env["PGSSLMODE"] = sslmode[0]
+    return env
+
+
+def _pending_from_db() -> str | None:
+    """Query the optional backend's `pending` table. None if unavailable.
+
+    Never raises: every failure mode (no backend configured, no psql on PATH,
+    unparseable URL, unreachable database, query timeout) returns None so the
+    caller can fall back to the file tier.
+    """
+    if not BRAIN_ENABLED:
+        return None
+    try:
+        conn = resolve_connection_string(MEMORY_REPO_DIR)
+        if not conn:
+            return None
+        if not shutil.which("psql"):
+            print("[session_start] pending: psql not on PATH", file=sys.stderr)
+            return None
+        env = _psql_env(conn)
+        if env is None:
+            print("[session_start] pending: unparseable connection string", file=sys.stderr)
+            return None
+
+        result = subprocess.run(
+            ["psql", "-t", "-A", "-F", "\t", "-c", PENDING_SQL],
+            capture_output=True,
+            text=True,
+            timeout=PENDING_TIMEOUT_S,
+            env=env,
+        )
+        if result.returncode != 0:
+            # stderr can echo the target host but never the password (it is
+            # passed via PGPASSWORD), so it is safe — and useful — to surface.
+            print(
+                f"[session_start] pending query exited {result.returncode}: "
+                f"{result.stderr.strip()[:200]}",
+                file=sys.stderr,
+            )
+            return None
+        return _render_pending_rows(result.stdout)
+    except Exception as e:
+        # Log the exception TYPE only. Several exception strings (notably
+        # subprocess.TimeoutExpired) embed the full argv, and a future edit
+        # that puts a credential back on the command line must not silently
+        # turn this line into a password leak.
+        print(f"[session_start] pending query failed: {type(e).__name__}", file=sys.stderr)
+        return None
+
+
+def pending_section() -> str:
+    """Render the pending brief: titles only, priority-ordered, capped.
+
+    Two sources, in order, so the hook works with or without a backend:
+
+      1. the `pending` table in the optional memory backend (BRAIN_ENABLED),
+         via `pending_add` / `pending_list` / `pending_resolve`
+      2. a plain `pending.md` file — the zero-setup default
+
+    Fail-open at every step: this must NEVER raise or block session start.
+    """
+    from_db = _pending_from_db()
+    if from_db is not None:
+        return from_db
+
+    try:
+        fallback = _pending_from_file()
+    except Exception as e:
+        print(f"[session_start] pending file read failed: {e}", file=sys.stderr)
+        fallback = None
+
+    return fallback or "## Pending\nNone.\n"
+
+
 # ── Brief builder ─────────────────────────────────────────────────────────────
 
 
@@ -632,14 +805,7 @@ def build_brief(state: dict, resumed: bool) -> str:
     sections.append("## Git\n" + "\n".join(git_items) + "\n")
 
     # Pending items
-    if PENDING_FILE.exists():
-        content = PENDING_FILE.read_text().strip()
-        # Strip header lines
-        lines = [l for l in content.splitlines() if not l.startswith("#")]
-        content = "\n".join(lines).strip()
-        sections.append(f"## Pending\n{content if content else 'None.'}\n")
-    else:
-        sections.append("## Pending\nNone.\n")
+    sections.append(pending_section())
 
     # Recent learnings (last 3 entries)
     if LEARNINGS.exists():

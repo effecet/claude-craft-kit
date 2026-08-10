@@ -6,11 +6,12 @@ help:           ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | \
 		awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'
 
-install:        ## Copy hooks/ + rules/ + CLAUDE.example.md into CLAUDE_DIR (default ~/.claude)
+install:        ## Copy hooks/ + rules/ + commands/ + CLAUDE.example.md into CLAUDE_DIR (default ~/.claude)
 	@echo "Installing into $(CLAUDE_DIR) ..."
-	@mkdir -p "$(CLAUDE_DIR)/hooks" "$(CLAUDE_DIR)/rules"
+	@mkdir -p "$(CLAUDE_DIR)/hooks" "$(CLAUDE_DIR)/rules" "$(CLAUDE_DIR)/commands"
 	@cp -r hooks/. "$(CLAUDE_DIR)/hooks/"
 	@cp -r rules/. "$(CLAUDE_DIR)/rules/"
+	@cp -r commands/. "$(CLAUDE_DIR)/commands/"
 	@cp CLAUDE.example.md "$(CLAUDE_DIR)/CLAUDE.example.md"
 	@echo "Done. Next steps:"
 	@echo "  1. cp config.example.sh \"$(CLAUDE_DIR)/config.local.sh\" and source it"

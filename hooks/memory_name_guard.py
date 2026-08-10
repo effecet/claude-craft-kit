@@ -6,18 +6,21 @@ Fires before a configurable memory-store "remember" tool call. Reads the
 tool input JSON from stdin and blocks (exit 2) if the memory `name` exceeds
 MAX_WORDS whitespace-separated tokens.
 
-Why a hook instead of a documented rule:
-A short-name convention documented only in prose tends to slip in practice,
-producing ugly kebab-truncated filenames like
-  feedback_dont-rush-simple-verifications-under-time-pressure.md
-Structural enforcement converts "I forgot" into "the harness reminded me".
+This is an OPTIONAL convention hook, not a correctness gate. It encodes the
+"keep names scannable" preference from rules/memory.md — drop it from your
+settings.json if you would rather write longer, more descriptive names. The
+failure mode actually worth avoiding is a name too vague to recall on, not a
+name that runs a few words long.
 
 Scope:
-- Fires only on the configured TARGET_TOOL (where the slug is generated).
-- Does NOT fire on an `update`-style call that keys on an existing id and
-  doesn't rename the file, so a long name there is harmless.
+- Fires only on the configured TARGET_TOOL, i.e. at create time.
+- Does NOT fire on an `update`-style call. That is a scope choice about where
+  the convention is worth enforcing, NOT a claim that renames never happen —
+  a backend may well re-slug the filename when `update` changes the name.
 
 Configuration:
+- MAX_WORDS — the ceiling, kept in step with rules/memory.md. Raise it
+  freely; it is a style preference.
 - TARGET_TOOL — the MCP tool name to guard. Override via the
   MEMORY_REMEMBER_TOOL env var to match your own memory-store MCP.
 """
@@ -28,7 +31,7 @@ import json
 import os
 import sys
 
-MAX_WORDS = 5
+MAX_WORDS = 8
 TARGET_TOOL = os.environ.get("MEMORY_REMEMBER_TOOL", "mcp__memory__remember")
 
 
@@ -54,11 +57,11 @@ def main() -> int:
     print(
         f"MEMORY NAME TOO LONG: {word_count} words (max {MAX_WORDS}).\n"
         f"  name: {name!r}\n\n"
-        f"Long names produce ugly kebab-truncated filenames in\n"
-        f"  <claude-dir>/projects/<encoded-cwd>/memory/<type>_<slug>.md\n\n"
-        f"Shorten to <={MAX_WORDS} words BEFORE calling remember(). The slug is\n"
-        f"derived from `name` and is locked at remember() time. Move any extra\n"
-        f"context into the `description` field (no length cap) or the body.",
+        f"The name is what you scan in the memory index, so keep it to the\n"
+        f"claim itself. Shorten to <={MAX_WORDS} words and move the nuance into\n"
+        f"the `description` field, which has no length cap and is what the\n"
+        f"index renders after the em dash.\n\n"
+        f"This is a style convention, not a hard limit — see rules/memory.md.",
         file=sys.stderr,
     )
     return 2  # blocking; stderr is fed back to Claude

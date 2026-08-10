@@ -1,30 +1,31 @@
 # Memory Auto-Capture Rules
 # ~/.claude/rules/memory.md
 
-## Memory Naming — ≤5 words (HARD RULE)
+## Memory Naming — concise, not capped
 
-**Every memory `name` field MUST be ≤5 whitespace-separated words.** Applies to ALL memory types (feedback, project, user, reference) and ALL entry points (create, update, wrap-up, in-session auto-capture).
+Memory `name` should be short enough to scan in the index — aim for **under ~8 words** — but there is **no hard limit**. Prefer a name that reads as the claim itself, and put the nuance in the `description:` frontmatter field, which has no length cap and is what the index renders after the `—`.
 
-A memory backend typically slugs the `name` to derive the markdown filename (`<type>_<slug>.md`). Long names produce ugly truncated kebab filenames that pollute the index and the project memory dir.
+A memory backend slugs the `name` to derive the markdown filename (`<type>_<slug>.md`). The reference backend caps that slug at **120 characters**, which no reasonable name reaches.
 
 ### Examples
 
-| ✅ Good (≤5 words) | ❌ Bad (6+ words) |
+| ✅ Good | ❌ Avoid |
 |---|---|
-| `MCP remember owns file sync` | `MCP remember owns file sync — don't manually Write` |
-| `Git API token scopes` | `Git API token scopes per account verified` |
-| `Confirm before git push` | `Always ask before git push, even when a prior message authorized it` |
-| `Flip plan boxes per task` | `When shipping a phased implementation plan, flip the per-task plan-doc checkboxes` |
+| `MCP remember owns file sync` | `sync` (too vague to match on) |
+| `Git API token scopes` | `stuff about tokens` |
+| `Confirm before git push` | `Always ask before git push, even when a prior message authorized it and the branch is clean` (that belongs in `description:`) |
 
-If the topic genuinely needs more nuance, put it in the `description:` frontmatter field (one line, no length cap, used for the index hover). The `name` is the slug source; `description` is the human label.
+The failure mode worth avoiding is a name too vague to recall on — not a name that is a few words long.
 
 ### Enforcement
 
-A PreToolUse hook can guard the create call: if `name` has >5 tokens, block it with stderr advice — shorten the name and retry. The hook need not fire on `update` (the slug is locked at create time; `update` keys on an ID and doesn't rename the file).
+`hooks/memory_name_guard.py` ships as an **optional** convention hook, wired in `settings.example.json`. It blocks names over `MAX_WORDS` (**8**, matching the guidance above) at create time with stderr advice. Treat it as a style preference, not a correctness gate: raise `MAX_WORDS`, or drop the hook from your `settings.json`, if you would rather write longer, more descriptive names.
+
+If you do keep it, note that it fires on create only. That is a deliberate scope choice, not a statement about renames — the reference backend **does** re-slug the filename when `update` changes the name, deleting the old-slug file so one entity never leaves two files behind.
 
 ### Why this is a top-level rule
 
-Kept slipping into sessions as a parenthetical, producing entries with long truncated kebab filenames. Promoting it to a top-level rule plus structural enforcement (the PreToolUse hook above) stops the drift at the source.
+Naming kept slipping into sessions as a parenthetical, producing entries nobody could find again. What matters is that the name states the claim; length is secondary.
 
 ---
 
@@ -49,7 +50,7 @@ Auto-save feedback when the user says things like:
 1. **Call your memory backend's create tool** (e.g. a `remember` call), or its update tool if the memory already exists — check first with a recall/search. A well-behaved backend handles the markdown write automatically:
    - Writes `~/.claude/projects/<encoded-cwd>/memory/<type>_<slug>.md`
    - Auto-updates the `MEMORY.md` index
-   - `<slug>` is derived from the memory `name` — see § Memory Naming above for the ≤5-word rule.
+   - `<slug>` is derived from the memory `name` — see § Memory Naming above. The slug caps at 120 chars; there is no word limit.
 2. **Append a dedup record** to `~/.claude/session/feedback_captured.json` (create the file if missing). Format:
    ```json
    {"saved_at": "<iso ts>", "filename": "feedback_<slug>.md", "trigger": "<one-line summary of what user said>"}

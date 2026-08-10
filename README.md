@@ -31,7 +31,7 @@ flowchart TD
     E --> F[PreToolUse guards]
     F -->|Bash: git commit / gh pr| G[gitleaks · pr_security_scan · ruff_workflow_guard]
     F -->|Write/Edit| H[prd_guard<br/>warn on prod paths]
-    F -->|memory write| I[memory_name_guard<br/>enforce ≤5-word names]
+    F -->|memory write| I[memory_name_guard<br/>keep memory names concise]
     G & H & I --> J[/Tiered validation gate<br/>validate_tier.py/]
     J -->|Skip| K[config/docs only]
     J -->|Light| L[2 reviewers · <30 LOC]
@@ -54,13 +54,13 @@ See **[docs/WORKFLOW.md](docs/WORKFLOW.md)** for the full walkthrough and the va
 
 | Stage | Hook | Does |
 |---|---|---|
-| SessionStart | `session_start.py` | Init/resume session state, git context, surface open specs |
+| SessionStart | `session_start.py` | Init/resume session state, git context, surface open specs + pending work |
 | SessionStart | `mcp_restore_guard.py` | Self-heal: re-register local stdio MCP servers that got dropped from `~/.claude.json` (opt-in via `mcp-restore.json`) |
 | UserPromptSubmit | `track.py`, `consume_prompt.py` | Message counting, token report, friction/goodbye detection, pending prompts |
 | PreToolUse | `gitleaks_guard.sh`, `pr_security_scan.sh` | Block commits/PRs that leak secrets |
 | PreToolUse | `prd_guard.sh` | Warn before editing prod-looking paths |
 | PreToolUse | `ruff_workflow_guard.py` | Ruff check before committing in CI repos |
-| PreToolUse | `memory_name_guard.py` | Enforce a memory-naming convention |
+| PreToolUse | `memory_name_guard.py` | Keep memory names concise (optional convention hook) |
 | (gate) | `validate_tier.py` | Pick the review tier from diff size + sensitive paths |
 | Stop | `stop_gate.py` | Block a clean exit until wrap-up runs on substantial sessions |
 | idle | `on_idle.sh` | Nudge a wrap-up after inactivity |
@@ -71,10 +71,20 @@ validation gate + TDD), `operations.md` (proposal gate, git safety), `memory.md`
 `project-hygiene.md`, `context7.md`, `data-engineering.md`, `typescript.md`,
 `supabase.md`, `tooling.md`, `npm-cache-eperm.md`.
 
+**Commands** (`commands/`) — slash commands installed into `~/.claude/commands/`:
+`/clear-pending` reviews the open pending queue and resolves what's already done
+(batched behind the proposal gate — nothing is resolved without approval).
+
 **Optional memory backend** (`hooks/optional/`) — `proactive_recall.py` and
 `backup_hook.py`, inert unless `BRAIN_ENABLED=true`. Wire them to any
 Postgres-backed memory store; a reference implementation is
 [**memory-persistor**](https://github.com/effecet/memory-persistor).
+
+**Pending work queue** — `session_start.py` surfaces deferred work in the session
+brief: the top open items, priority-ordered. It reads a plain `pending.md` by
+default, and with `BRAIN_ENABLED=true` reads the backend's `pending` table instead
+(written via memory-persistor's `pending_add` / `pending_resolve` tools). Both paths
+fail open — a missing file or unreachable database never blocks session start.
 
 ## Quick start
 
@@ -128,10 +138,12 @@ claude-craft-kit/
 │   ├── on_idle.sh              # idle: wrap-up nudge
 │   ├── spec_audit.py           # report open specs
 │   ├── _state.py               # session-state schema
-│   ├── common.py               # path helpers
+│   ├── common.py               # path + connection-string helpers
 │   └── optional/               # backend-coupled, BRAIN_ENABLED=false by default
 │       ├── proactive_recall.py # surface relevant memories per prompt
 │       └── backup_hook.py      # generic git backup of your config
+├── commands/
+│   └── clear-pending.md        # /clear-pending — triage the pending work queue
 ├── rules/                      # the 10 behavior rules
 └── tests/                      # hook unit tests (pytest)
 ```
