@@ -15,7 +15,12 @@ jobs:
       - name: Install tools
         run: |
           uv venv
-          uv pip install ruff pytest
+          # Pinned deliberately. An unpinned `ruff` turned CI red on untouched
+          # files when 0.16.x widened its default rule set. ruff.toml now
+          # declares `select` explicitly so that can't happen again, but a
+          # pinned linter also keeps a given commit's CI result reproducible.
+          # Bump this on purpose, in its own commit.
+          uv pip install 'ruff==0.16.2' pytest
           sudo apt-get update && sudo apt-get install -y shellcheck
 
       - name: Ruff lint (hooks)

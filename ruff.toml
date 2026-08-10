@@ -1,5 +1,27 @@
 # Lint config for claude-craft-kit.
-# E741 (ambiguous variable name 'l') is an accepted nit in short hook
-# comprehensions — these are small private-harness scripts, not a library API.
 [lint]
+# `select` is declared EXPLICITLY rather than inherited from ruff's defaults.
+# It happens to spell out what those defaults were (pycodestyle errors +
+# Pyflakes), but writing it down is the point: relying on the implicit default
+# means a ruff release that widens it silently redefines this repo's lint
+# contract and turns CI red on files nobody touched. That is exactly what
+# happened on ruff 0.16.x, which promoted flake8-bandit (S), flake8-blind-except
+# (BLE), and pylint-warning (PLW) rules into the default set — 88 findings
+# appeared across untouched hooks in a single unpinned upgrade.
+#
+# These hooks legitimately break several of those rules by design:
+#   BLE001 / S110 / S112 — a hook must FAIL OPEN. Every one of these blind
+#     `except Exception: pass` blocks is deliberate; a hook that raises would
+#     block the user's session over a best-effort side task.
+#   PLW1510 — `subprocess.run` without `check=`; return codes are inspected
+#     explicitly where they matter.
+#   S603 / S607 — subprocess with list args (never shell=True) and partial
+#     executable paths for system tools (git, psql). Not an attack surface here.
+#
+# To adopt any of them, add it here and fix the findings in the same change —
+# don't let it arrive by surprise.
+select = ["E4", "E7", "E9", "F"]
+
+# E741 (ambiguous variable name 'l') is an accepted nit in short hook
+# comprehensions — these are small scripts, not a library API.
 ignore = ["E741"]
