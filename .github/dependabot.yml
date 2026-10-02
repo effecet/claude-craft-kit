@@ -1,0 +1,15 @@
+# Dependabot version updates. Security alerts are configured separately
+# (repo Settings -> Code security); this file schedules version bumps.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "[ci]"
+    groups:
+      github-actions:
+        patterns:
+          - "*"
