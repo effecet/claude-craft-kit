@@ -19,9 +19,7 @@ The failure mode worth avoiding is a name too vague to recall on — not a name 
 
 ### Enforcement
 
-`hooks/memory_name_guard.py` ships as an **optional** convention hook, wired in `settings.example.json`. It blocks names over `MAX_WORDS` (**8**, matching the guidance above) at create time with stderr advice. Treat it as a style preference, not a correctness gate: raise `MAX_WORDS`, or drop the hook from your `settings.json`, if you would rather write longer, more descriptive names.
-
-If you do keep it, note that it fires on create only. That is a deliberate scope choice, not a statement about renames — the reference backend **does** re-slug the filename when `update` changes the name, deleting the old-slug file so one entity never leaves two files behind.
+None, deliberately. An earlier version of this kit shipped a `memory_name_guard.py` hook that blocked long names at create time. It was retired: it could only see `remember`, never `update`, so names drifted past the limit through renames anyway — enforcement on new writes while the corpus moved on. Keep the guidance above as a convention. `hooks/memory_name_guard.py` remains for now as a no-op stub, so an old `settings.json` entry for it does not block memory writes — remove that entry.
 
 ### Why this is a top-level rule
 

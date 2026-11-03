@@ -10,13 +10,16 @@ Responsibilities:
 """
 
 import json
+import math
 import os
+import re
 import shutil
 import socket
 import subprocess
 import sys
 import time
 import urllib.parse
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -34,6 +37,48 @@ MACHINE_ID = socket.gethostname().split(".")[0]  # short hostname for commit tag
 
 PENDING_BRIEF_LIMIT = 10  # mirrors PENDING_BRIEF_LIMIT in the backend's config
 PENDING_TIMEOUT_S = 5  # session start must not stall on a slow connection
+
+# Claude Code caps a hook's plain stdout at 10,000 characters, measured whole,
+# with no setting to raise it. Over the cap the model gets a file path and a
+# 2,000-char preview and is NOT asked to read the rest, so whatever comes last
+# silently vanishes. The budget leaves room under that for the meter line.
+STDOUT_BUDGET = 9_000
+STDOUT_OVERFLOW_FILE = CLAUDE_DIR / "session/session_start_full.txt"
+_METER_RESERVE = 300
+# A single line longer than this is clipped, so it cannot push every alert
+# after it out of the budget.
+_LINE_CAP = 1_000
+
+# ---- Optional config-checkout checks — every one is silent until configured.
+# CRAFT_CONFIG_REPO      git checkout your ~/.claude hooks/scripts deploy from
+#                        (enables the deployed-hook drift check).
+# CRAFT_CONFIG_SUBDIR    subdirectory of that checkout holding hooks/ and
+#                        scripts/ (default: the checkout root, as in this kit).
+# CRAFT_CONFIG_BRANCH    branch the live hooks should come from (default: main).
+# CRAFT_CANARY_FILE      heartbeat file a scheduled job writes Unix time into;
+# CRAFT_CANARY_MAX_AGE_H warn once it is older than this many hours (default 3).
+# CRAFT_GIT_HOOKS_DIR    global git hooks dir that core.hooksPath must point at.
+CONFIG_REPO = (
+    Path(os.path.expanduser(os.environ["CRAFT_CONFIG_REPO"]))
+    if os.environ.get("CRAFT_CONFIG_REPO")
+    else None
+)
+CONFIG_SUBDIR = os.environ.get("CRAFT_CONFIG_SUBDIR", "").strip("/")
+CONFIG_BRANCH = os.environ.get("CRAFT_CONFIG_BRANCH", "main")
+CANARY_FILE = (
+    Path(os.path.expanduser(os.environ["CRAFT_CANARY_FILE"]))
+    if os.environ.get("CRAFT_CANARY_FILE")
+    else None
+)
+try:
+    CANARY_MAX_AGE_H = float(os.environ.get("CRAFT_CANARY_MAX_AGE_H", "3"))
+except ValueError:
+    CANARY_MAX_AGE_H = 3.0
+
+
+def _config_dir(root: Path) -> Path:
+    """The directory holding hooks/ and scripts/ inside a config checkout."""
+    return root / CONFIG_SUBDIR if CONFIG_SUBDIR else root
 
 # rf-string (not f-string): PENDING_BRIEF_LIMIT still interpolates, but the
 # E'\t' / E'\n' escapes below must reach Postgres as the literal two-char
@@ -106,6 +151,8 @@ def init_state() -> tuple[dict, bool]:
     Wrap-up state (set by track.py / stop_gate.py / wrap-up skill):
         wrap_up_ran (bool)            True after wrap-up skill completes Phase 5
         wrap_up_prompted (bool)       True after the user has been ASKED about wrap-up (any trigger)
+        stop_gate_prompted (bool)     True once stop_gate.py has shown its reminder (its own key,
+                                      so it never disarms the track.py reminders)
         threshold_prompted (bool)     True after the message-count threshold prompt fired
         idle_prompted (bool)          True after the idle-watcher prompted
         last_idle_trigger (int)       Unix timestamp of last idle trigger fire
@@ -835,7 +882,736 @@ def build_brief(state: dict, resumed: bool) -> str:
     return "\n---\n".join(sections)
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ── Config-checkout checks ────────────────────────────────────────────────────
+
+
+def _managed_checkout(hooks_link: Path | None = None) -> tuple[Path, str] | None:
+    """(toplevel, branch) of the config checkout that ~/.claude/hooks links into.
+
+    None unless CRAFT_CONFIG_REPO is set, when the hooks are real-file copies,
+    when the link does not lead into a git checkout, when that checkout is not
+    CRAFT_CONFIG_REPO, or when the link is not `<toplevel>/<CRAFT_CONFIG_SUBDIR>/hooks`.
+    """
+    if CONFIG_REPO is None:
+        return None  # silent until configured
+    link = hooks_link or CLAUDE_DIR / "hooks"
+    if not link.is_symlink():
+        return None
+    try:
+        target = link.resolve()
+        res = subprocess.run(
+            [
+                "git", "-c", "core.fsmonitor=false", "-C", str(target),
+                "rev-parse", "--show-toplevel", "--abbrev-ref", "HEAD",
+            ],
+            capture_output=True,
+            text=True,
+            errors="replace",  # a non-UTF-8 path must not raise out of the brief
+            timeout=5,
+        )
+    except (OSError, RuntimeError, subprocess.TimeoutExpired):  # RuntimeError: link loop
+        return None
+    lines = res.stdout.splitlines()  # not split(): a repo path may hold spaces
+    if res.returncode != 0 or len(lines) != 2:
+        return None  # not a git checkout: nothing to say
+    toplevel, branch = lines
+    # Only the managed layout: git walks up from any directory, and ~/.claude
+    # is itself a repo, so a link elsewhere could report an unrelated branch.
+    if target != _config_dir(Path(toplevel)) / "hooks":
+        return None
+    try:
+        if Path(toplevel).resolve() != CONFIG_REPO.resolve():
+            return None  # some other checkout: not the one you asked about
+    except (OSError, RuntimeError):
+        return None
+    return Path(toplevel), branch
+
+
+def live_hooks_branch(hooks_link: Path | None = None) -> list[str]:
+    """Warn when the live hooks come from a checkout that is not on its main branch.
+
+    When `~/.claude/hooks` symlinks into a working clone that feature work also
+    switches branches in, every session's guards are whatever branch was last
+    checked out, so a merged fix can stay dead. Silent on CRAFT_CONFIG_BRANCH
+    (default `main`), and silent where hooks are real-file copies.
+    """
+    checkout = _managed_checkout(hooks_link)
+    if checkout is None:
+        return []
+    toplevel, branch = checkout
+    if branch == CONFIG_BRANCH:
+        return []
+    where = "a detached HEAD" if branch == "HEAD" else f"branch {branch}"
+    return [
+        f"⚠️ live hooks come from {where} (not {CONFIG_BRANCH}) in {toplevel} "
+        f"— merged fixes are not live until it returns to {CONFIG_BRANCH}."
+    ]
+
+
+CONFIG_UNTRACKED_SHOWN = 3
+
+
+def config_untracked(hooks_link: Path | None = None) -> list[str]:
+    """Warn when the config checkout has untracked files.
+
+    A new skill, rule or hook dropped into the checkout is live at once but
+    not in git, so it is lost with the machine and never reaches your other
+    machines. Untracked only — modified tracked files are routine churn.
+    Silent when clean, and where hooks are real-file copies.
+    """
+    checkout = _managed_checkout(hooks_link)
+    if checkout is None:
+        return []
+    toplevel, _branch = checkout
+    try:
+        res = subprocess.run(
+            ["git", "-c", "core.fsmonitor=false", "-C", str(toplevel),
+             "status", "--porcelain", "-z", "--", CONFIG_SUBDIR or "."],
+            # errors="replace": a non-UTF-8 name must not raise out of the brief
+            capture_output=True, text=True, errors="replace", timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if res.returncode != 0:
+        return []
+    # -z turns off git's quoting, so a name arrives raw: mask control
+    # characters before it reaches the brief.
+    paths = [
+        "".join(c if c.isprintable() else "?" for c in e[3:])
+        for e in res.stdout.split("\0")
+        if e.startswith("?? ")
+    ]
+    if not paths:
+        return []
+    shown = ", ".join(paths[:CONFIG_UNTRACKED_SHOWN])
+    more = len(paths) - CONFIG_UNTRACKED_SHOWN
+    if more > 0:
+        shown += f" (+{more} more)"
+    return [
+        f"⚠️ {len(paths)} untracked path(s) in the config checkout {toplevel} "
+        f"— live now, but not in git until you commit them: {shown}"
+    ]
+
+
+CANARY_SKEW_S = 300  # a stamp this far in the future is not clock jitter
+
+
+def canary_liveness(
+    stamp: Path | None = None, max_age_h: float | None = None, now: float | None = None
+) -> list[str]:
+    """Warn when a heartbeat file you configured has gone stale.
+
+    For a scheduled job whose silence would otherwise go unnoticed (a watcher,
+    a backup): have it write the current Unix time to CRAFT_CANARY_FILE on
+    every run, and set CRAFT_CANARY_MAX_AGE_H to a few missed intervals. A
+    stale or missing stamp means the job is not running at all. Silent unless
+    CRAFT_CANARY_FILE is set.
+    """
+    stamp = stamp if stamp is not None else CANARY_FILE
+    max_age_h = max_age_h if max_age_h is not None else CANARY_MAX_AGE_H
+    if stamp is None:
+        return []
+    now = time.time() if now is None else now
+    try:
+        # float first: a job writing Python's time.time() leaves a decimal stamp.
+        last = float(stamp.read_text().strip())
+        if not math.isfinite(last) or not 0 <= last < 1e11:
+            raise ValueError("not a plausible Unix time")
+    except (OSError, ValueError):
+        return [f"⚠️ canary: no run recorded at {stamp} — the job may never have run."]
+    age = now - last
+    if age < -CANARY_SKEW_S:
+        # A future stamp would otherwise read as healthy forever.
+        return [f"⚠️ canary stamp at {stamp} is in the future — cannot tell if the job runs."]
+    if age <= max_age_h * 3600:
+        return []
+    return [f"⚠️ canary has not run for {age / 3600:.0f}h (limit {max_age_h:g}h) — check the job behind {stamp}."]
+
+
+GITLEAKS_MIN = (8, 19)  # `gitleaks git`, which the pre-commit hook runs
+MIN_TEXT = ".".join(map(str, GITLEAKS_MIN))
+
+
+def secret_scan_status(
+    home: Path | None = None, env: dict[str, str] | None = None
+) -> list[str]:
+    """Warn when a global pre-commit secret scan you rely on is not really running.
+
+    A global git hook that runs gitleaks typically fails OPEN without the
+    binary (one stderr line per commit, easy to miss) and CLOSED on a gitleaks
+    too old for `gitleaks git`, so a machine can sit unscanned or stuck for
+    weeks. Checks that the global core.hooksPath points at CRAFT_GIT_HOOKS_DIR,
+    then finds gitleaks on PATH or GITLEAKS_HOOK_SEARCH_PATH. Silent unless
+    CRAFT_GIT_HOOKS_DIR is set.
+    """
+    home = home or Path.home()
+    env = env if env is not None else dict(os.environ)
+    raw = env.get("CRAFT_GIT_HOOKS_DIR", "")
+    if not raw:
+        return []
+    ours = Path(str(home) + raw[1:]) if raw == "~" or raw.startswith("~/") else Path(raw)
+    if ours.is_symlink() and not ours.exists():
+        # The clone it points into is on a branch without the hooks dir:
+        # git finds no hooks there and runs none, silently.
+        return [
+            f"⚠️ commits are NOT scanned for secrets: {ours} points to the missing "
+            f"{os.readlink(ours)} — switch that clone back to {CONFIG_BRANCH}."
+        ]
+    if not ours.exists():
+        return []
+    msgs: list[str] = []
+    try:
+        res = subprocess.run(
+            ["git", "config", "--global", "--get", "core.hooksPath"],
+            capture_output=True, text=True, errors="replace", timeout=5, env=env,
+        )
+        current = res.stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        current = ""
+    if current == "~" or current.startswith("~/"):
+        current_path = str(home) + current[1:]
+    else:
+        current_path = current
+    configured = Path(current_path) if current else None
+    try:
+        same = configured is not None and configured.resolve() == ours.resolve()
+    except (OSError, RuntimeError):  # RuntimeError: a symlink loop
+        same = False
+    if configured is None:
+        msgs.append(
+            "⚠️ commits are NOT scanned for secrets: no global core.hooksPath — "
+            f"run `git config --global core.hooksPath {ours}`."
+        )
+    elif not same:
+        msgs.append(
+            f"⚠️ commits are NOT scanned for secrets: global core.hooksPath is "
+            f"{current}, not {ours}."
+        )
+
+    search = env.get(
+        "GITLEAKS_HOOK_SEARCH_PATH",
+        f"/opt/homebrew/bin:/usr/local/bin:{home}/.local/bin:{home}/bin",
+    )
+    dirs = [*env.get("PATH", "").split(":"), *search.split(":")]
+    binary = next(
+        # Absolute dirs only: a relative entry like `.` would run a gitleaks
+        # planted in whatever project the session starts in.
+        (
+            Path(d) / "gitleaks"
+            for d in dirs
+            if d and Path(d).is_absolute() and os.access(Path(d) / "gitleaks", os.X_OK)
+        ),
+        None,
+    )
+    if binary is None:
+        msgs.append(
+            "⚠️ commits are NOT scanned for secrets: no gitleaks binary on PATH "
+            f"or the hook's search path — install gitleaks {MIN_TEXT}+."
+        )
+        return msgs
+    # A literal argv[0], with the found directory first on PATH, so this call
+    # can only ever run `gitleaks`.
+    run_env = {**env, "PATH": f"{binary.parent}:{env.get('PATH', '')}"}
+    try:
+        out = subprocess.run(
+            ["gitleaks", "version"], capture_output=True, text=True, errors="replace",
+            timeout=5, env=run_env,
+        ).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return msgs
+    m = re.search(r"(\d+)\.(\d+)", out)
+    if m and (int(m.group(1)), int(m.group(2))) < GITLEAKS_MIN:
+        msgs.append(
+            f"⚠️ every commit is BLOCKED: gitleaks {m.group(0)} at {binary} is older "
+            f"than {MIN_TEXT} (no `gitleaks git`) — upgrade it."
+        )
+    return msgs
+
+
+# ── Deployed-hook drift ──────────────────────────────────────────────────────
+
+# Deployable files live in these subdirectories of the config checkout and are
+# deployed to the same-named subdirectory of ~/.claude. settings.json can add
+# more destinations on top (see _hook_drift_targets).
+HOOK_DRIFT_SOURCE_DIRS = ("hooks", "scripts")
+HOOK_DRIFT_SUFFIXES = (".py", ".sh")
+# Files you keep as deliberate per-machine forks. Extend with
+# CRAFT_HOOK_DRIFT_EXCLUDE (comma-separated basenames).
+HOOK_DRIFT_EXCLUDE = frozenset(
+    {"settings.json"}
+    | {n.strip() for n in os.environ.get("CRAFT_HOOK_DRIFT_EXCLUDE", "").split(",") if n.strip()}
+)
+_INVOKED_PATH_RE = re.compile(r"[~$@\w./{}-]{0,256}/[\w.-]{1,128}\.(?:py|sh)(?![\w.])")
+_SETTINGS_SCAN_LIMIT = 200_000
+_ENV_VAR_RE = re.compile(r"\$\{(\w+)\}|\$(\w+)")
+
+
+def _expand_home(token: str, home: Path) -> Path | None:
+    """Resolve ~ and $VAR / ${VAR} in a settings.json path token.
+
+    Environment variables are expanded generally rather than special-casing
+    HOME, so $CLAUDE_PROJECT_DIR — which Claude Code itself sets and which real
+    settings files use — resolves instead of being silently skipped. HOME is
+    overridden with the caller's value so tests can point at a fake home.
+
+    Substitution is anchored on a whole variable name: a naive
+    `replace("$HOME", ...)` also rewrites `$HOMEBREW_PREFIX`, producing a path
+    under a home directory that does not exist.
+
+    Returns None for anything still relative, and for anything that escapes
+    `home` once resolved. A relative command is resolved against a working
+    directory this process does not share, and `..` segments could otherwise
+    walk the scan outside the deploy tree entirely. Both are silent skips
+    rather than errors — a path this code cannot place is not drift.
+    """
+    env = {**os.environ, "HOME": str(home)}
+
+    def sub(match: re.Match[str]) -> str:
+        name = match.group(1) or match.group(2)
+        return env.get(name, match.group(0))
+
+    text = _ENV_VAR_RE.sub(sub, token)
+    if text.startswith("~/"):
+        text = str(home) + text[1:]
+    # normpath collapses `..` TEXTUALLY. The path is never resolve()d: doing so
+    # follows a symlinked ~/.claude/hooks back into the repo, making every
+    # settings-derived hook a self-pair under a third "destination" that is
+    # really the source — inflating the coverage counts this alert reports, and
+    # defeating dedup against the static floor.
+    candidate = Path(os.path.normpath(text))
+    try:
+        # Containment is TEXTUAL, on the normalized path. normpath already
+        # collapsed `..`, so $HOME/../../etc/hooks/x.py cannot pass — while a
+        # legitimate ~/.claude/hooks that SYMLINKS outside $HOME still does.
+        # Validating the resolved path instead dropped every settings-derived
+        # target on such a machine, silently.
+        candidate.relative_to(Path(os.path.normpath(str(home))))
+    except ValueError:
+        return None
+    return candidate
+
+
+def _settings_invoked_paths(settings_path: Path, home: Path) -> list[Path]:
+    """Absolute .py/.sh paths invoked by the LIVE settings.json.
+
+    Read as TEXT and matched with a regex rather than parsed as JSON on
+    purpose: commands live at several different depths and key names, and a
+    settings file that fails to parse should still yield its paths rather than
+    silently contributing nothing.
+
+    ValueError is caught alongside OSError because read_text() raises
+    UnicodeDecodeError (a ValueError) on a non-UTF-8 file. Letting that escape
+    reached hook_drift's outer handler and disabled the WHOLE check while this
+    docstring claimed the static floor still applied.
+    """
+    try:
+        raw = settings_path.read_text()[:_SETTINGS_SCAN_LIMIT]
+    except (OSError, ValueError):
+        return []  # absent, unreadable, or not text — the static floor applies
+    out: list[Path] = []
+    for match in _INVOKED_PATH_RE.finditer(raw):
+        resolved = _expand_home(match.group(0), home)
+        if resolved is not None:
+            out.append(resolved)
+    return out
+
+
+def _hook_drift_targets(
+    repo_root: Path,
+    claude_dir: Path,
+    settings_path: Path,
+    home: Path | None = None,
+) -> list[tuple[Path, Path]]:
+    """Ordered, deduped (repo_file, deployed_file) pairs to compare.
+
+    `home` anchors ~ and $HOME expansion and defaults to claude_dir.parent,
+    which holds for the real layout (CLAUDE_DIR = ~/.claude).
+
+    Two sources, unioned:
+
+    1. The static floor — every deployable file under <config>/<sub>/ against
+       ~/.claude/<sub>/. A file whose basename is unique across the source dirs
+       is ALSO paired against the other deploy dirs when a copy exists there,
+       since a hook can be installed into scripts/ (or the reverse). Skipped
+       for an ambiguous basename, which cannot be attributed to one source.
+    2. The live settings.json — every path it actually invokes whose basename
+       has a counterpart in the checkout. That filter is what makes it safe to
+       read a real settings file: a path into some unrelated project has no
+       counterpart and is ignored rather than compared against nothing. It is
+       also how a machine-specific destination is found without hardcoding it.
+    """
+    if home is None:
+        home = claude_dir.parent
+    config = _config_dir(repo_root)
+
+    # name -> [(source subdir, repo file)]. Keyed as a LIST, not a single
+    # entry: a bare basename index silently attributed a deployed file to
+    # whichever source dir was scanned first, reporting a byte-identical file
+    # as diverged.
+    sources: dict[str, list[tuple[str, Path]]] = {}
+    pairs: list[tuple[Path, Path]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add(repo_file: Path, deployed_file: Path) -> None:
+        key = (str(repo_file), str(deployed_file))
+        if key not in seen:
+            seen.add(key)
+            pairs.append((repo_file, deployed_file))
+
+    for sub in HOOK_DRIFT_SOURCE_DIRS:
+        source_dir = config / sub
+        if not source_dir.is_dir():
+            continue
+        for repo_file in sorted(source_dir.iterdir()):
+            if repo_file.suffix not in HOOK_DRIFT_SUFFIXES or not repo_file.is_file():
+                continue
+            sources.setdefault(repo_file.name, []).append((sub, repo_file))
+
+    for name, candidates in sorted(sources.items()):
+        for sub, repo_file in candidates:
+            add(repo_file, claude_dir / sub / name)
+        if len(candidates) == 1:
+            _, repo_file = candidates[0]
+            for other in HOOK_DRIFT_SOURCE_DIRS:
+                cross = claude_dir / other / name
+                # Only when it actually exists: a cross-dir install is the
+                # exception, so pairing every file against every
+                # deploy dir invents targets that can never be found and makes
+                # the reported denominator a fiction.
+                if cross.is_file():
+                    add(repo_file, cross)
+
+    for deployed_file in _settings_invoked_paths(settings_path, home):
+        # TWO conditions, and both are load-bearing. Basename alone would
+        # compare <config>/scripts/probe.sh against an unrelated project's
+        # scripts/probe.sh and report drift that means nothing — and a check
+        # the operator learns to skim is worse than no check. Requiring the
+        # parent directory to be named like a deploy target bounds that to a
+        # foreign repo that also uses hooks/ or scripts/ AND collides on a
+        # filename, which is documented as the accepted residual risk.
+        if deployed_file.parent.name not in HOOK_DRIFT_SOURCE_DIRS:
+            continue
+        candidates = sources.get(deployed_file.name, [])
+        if len(candidates) == 1:
+            add(candidates[0][1], deployed_file)
+            continue
+        # Ambiguous basename: attribute it by the deploy directory's name, and
+        # skip entirely if that still does not single one out. Guessing here is
+        # what produces a false "diverged" on a file that is in sync.
+        matched = [rf for sub, rf in candidates if sub == deployed_file.parent.name]
+        if len(matched) == 1:
+            add(matched[0], deployed_file)
+
+    return pairs
+
+
+def hook_drift(
+    deployed_dir: Path | None = None,
+    repo_hooks: Path | None = None,
+    *,
+    repo_root: Path | None = None,
+    claude_dir: Path | None = None,
+    settings_path: Path | None = None,
+) -> list[str]:
+    """Warn when deployed hooks and scripts differ from the config checkout.
+
+    Where ~/.claude/hooks holds real file COPIES, nothing else compares them
+    with the repo, so an edited deployed copy (a local fork) can be silently
+    overwritten by the next copy step, and a stale one keeps running old code.
+    Each differing file is classified by direction: AHEAD (the deployed copy
+    has lines the repo lacks — upstream it first), stale (safe to re-copy), or
+    diverged (both). A same-file pair (a symlinked hooks dir) is skipped per
+    pair, not for the whole check.
+
+    Two calling forms: (deployed_dir, repo_hooks) compares one directory pair;
+    (repo_root, claude_dir, settings_path) runs discovery, defaulting to
+    CRAFT_CONFIG_REPO and this machine's ~/.claude. Silent when
+    CRAFT_CONFIG_REPO is unset or a directory is missing, and fail-open: any
+    error is logged to stderr and the check reports nothing.
+
+    Returns 0 or 1 strings, matching the sibling checks in this file.
+    """
+    explicit = deployed_dir is not None or repo_hooks is not None
+    discovery = (
+        repo_root is not None or claude_dir is not None or settings_path is not None
+    )
+    if explicit and discovery:
+        raise TypeError(
+            "hook_drift: pass either (deployed_dir, repo_hooks) or "
+            "(repo_root, claude_dir, settings_path), not both"
+        )
+    try:
+        if explicit:
+            deployed = (
+                Path(deployed_dir) if deployed_dir is not None else CLAUDE_DIR / "hooks"
+            )
+            repo = (
+                Path(repo_hooks)
+                if repo_hooks is not None
+                else (_config_dir(CONFIG_REPO) / "hooks" if CONFIG_REPO else None)
+            )
+            if repo is None:
+                return []
+            if not deployed.is_dir() or not repo.is_dir():
+                return []
+            pairs = [
+                (f, deployed / f.name)
+                for f in sorted(repo.iterdir())
+                if f.suffix in HOOK_DRIFT_SUFFIXES and f.is_file()
+            ]
+        else:
+            root = Path(repo_root) if repo_root is not None else CONFIG_REPO
+            if root is None:
+                return []
+            live_dir = Path(claude_dir) if claude_dir is not None else CLAUDE_DIR
+            settings = (
+                Path(settings_path)
+                if settings_path is not None
+                else live_dir / "settings.json"
+            )
+            pairs = _hook_drift_targets(root, live_dir, settings)
+            if not pairs:
+                print(
+                    "[session_start] hook_drift found no targets under "
+                    f"{_config_dir(root)} — repo checkout not found? "
+                    "This check is covering nothing.",
+                    file=sys.stderr,
+                )
+
+        drift: dict[str, list[str]] = {"fork": [], "stale": [], "diverged": []}
+        targets = 0
+        compared = 0
+        destinations: set[str] = set()
+
+        for repo_file, live in pairs:
+            name = repo_file.name
+            if name in HOOK_DRIFT_EXCLUDE:
+                continue
+            targets += 1
+            destinations.add(str(live.parent))
+            if not live.is_file():
+                continue  # not deployed on this machine — not drift
+            try:
+                # PER-PAIR symlink/hardlink skip. Same file on disk (a
+                # symlinked hooks dir, or a hardlinked script) means
+                # there is nothing to compare — but only for THIS pair.
+                if repo_file.resolve() == live.resolve() or repo_file.samefile(live):
+                    continue
+            except OSError as exc:
+                print(
+                    f"[session_start] hook_drift could not stat {name}: {exc}",
+                    file=sys.stderr,
+                )
+                continue
+            try:
+                a = repo_file.read_text().splitlines()
+                b = live.read_text().splitlines()
+            except Exception as exc:  # noqa: S112 - logged, not swallowed
+                # An unreadable hook is itself worth knowing about, but it must
+                # not stop the other files from being checked.
+                print(
+                    f"[session_start] hook_drift skipped {name}: {exc}",
+                    file=sys.stderr,
+                )
+                continue
+            compared += 1
+            if a == b:
+                continue
+            # Set comparison, not a diff: we only need the DIRECTION.
+            only_repo, only_live = set(a) - set(b), set(b) - set(a)
+            if only_live and only_repo:
+                drift["diverged"].append(name)
+            elif only_live:
+                drift["fork"].append(name)  # deployed has content the repo lacks
+            elif only_repo:
+                drift["stale"].append(name)
+            else:
+                # Neither side has a unique line, yet the files differ — a pure
+                # reordering, reindent, or a duplicated line. Deliberately
+                # SILENT: this check exists to stop a destructive copy and to
+                # surface unreviewed local code, and this is neither. Nothing
+                # unique is lost by overwriting, so there is nothing to act on.
+                #
+                # The accepted blind spot is a file whose only change is a
+                # duplicated existing line. Reporting every reindent to catch
+                # that would trade a real false-positive stream for a
+                # near-impossible one, and a check the operator learns to skim
+                # is worse than no check.
+                continue
+
+        if not any(drift.values()):
+            return []
+        return [_hook_drift_line(drift, compared, targets, len(destinations))]
+    except Exception as exc:
+        # Silent in the brief, but never silent everywhere — otherwise a real
+        # failure is indistinguishable from "no drift".
+        print(f"[session_start] hook_drift failed: {exc}", file=sys.stderr)
+        return []
+
+
+def _hook_drift_line(
+    drift: dict[str, list[str]], compared: int, targets: int, destinations: int
+) -> str:
+    """One line, forks named first — they are the only destructive case.
+
+    Stale files are counted, not named: they are fixed by re-copying. Forks and
+    diverged files are named, because each needs a human to look at that file
+    before anything is copied over it. The coverage clause says how much was
+    actually compared AND how much was discovered, so a check covering part of
+    the surface does not read as covering all of it.
+    """
+    parts = []
+    if drift["fork"]:
+        parts.append(f"{len(drift['fork'])} AHEAD of repo ({', '.join(drift['fork'])})")
+    if drift["diverged"]:
+        names = ", ".join(drift["diverged"])
+        parts.append(f"{len(drift['diverged'])} diverged ({names})")
+    if drift["stale"]:
+        parts.append(f"{len(drift['stale'])} stale")
+    needs_review = drift["fork"] or drift["diverged"]
+    verb = "upstream before copying" if needs_review else "safe to re-copy"
+    return (
+        f"⚠️ Deployed hooks differ from the repo: {', '.join(parts)} — {verb}. "
+        f"Scanned {compared} of {targets} target(s) across {destinations} "
+        "destination(s); copies installed by launchd/systemd units are not covered."
+    )
+
+
+# ── Stdout budget ───────────────────────────────────────────────────────────
+
+
+@dataclass
+class MsgGroup:
+    """One source of stdout lines. `rank` None means an alert group, which
+    never degrades; a degradable group shrinks to a pointer, lowest rank first."""
+
+    name: str
+    lines: list[str]
+    rank: int | None = None
+
+
+def build_groups(
+    *,
+    sync: list[str],
+    decay: list[str],
+    evolve: list[str],
+    config: list[str],
+    dedup: list[str],
+    brain: list[str],
+    hook_drift: list[str],
+) -> list[MsgGroup]:
+    """main()'s groups, in output order. Correctness alerts (config, brain,
+    hook_drift) have no rank and never degrade; the rest degrade
+    cheapest-first: evolve nudges, then decay, sync, dedup."""
+    return [
+        MsgGroup("sync", sync, rank=2),
+        MsgGroup("decay", decay, rank=1),
+        MsgGroup("evolve", evolve, rank=0),
+        MsgGroup("config", config),
+        MsgGroup("dedup", dedup, rank=3),
+        MsgGroup("brain", brain),
+        MsgGroup("hook_drift", hook_drift),
+    ]
+
+
+def _stdout_footer() -> str:
+    return (
+        f"Read {BRIEF_FILE} and present a session orientation (max 10 lines).\n"
+        "Lead with the most actionable item: pending items > dirty repos > last session gap.\n"
+        "If everything is clean, say so briefly. Tone: oriented co-pilot, not a greeter."
+    )
+
+
+def _clip(line: str) -> str:
+    return line if len(line) <= _LINE_CAP else line[:_LINE_CAP] + " …(clipped)"
+
+
+def _write_overflow(overflow_file: Path, text: str) -> bool:
+    """Best effort. A failure here must never cost the session its stdout."""
+    try:
+        overflow_file.parent.mkdir(parents=True, exist_ok=True)
+        overflow_file.write_text(text)
+        return True
+    except OSError as e:
+        print(f"[session_start] overflow write failed: {e}", file=sys.stderr)
+        return False
+
+
+def _clear_overflow(overflow_file: Path) -> None:
+    """A previous run's overflow must not outlive the session it described."""
+    try:
+        overflow_file.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _degrade(groups: list[MsgGroup], current: dict[str, list[str]], fits, where: str) -> list[str]:
+    """Shrink degradable groups to a pointer, cheapest rank first, until the
+    body fits — and only where the pointer is shorter than what it replaces.
+    Mutates `current`; returns the names of the groups it shrank."""
+    dropped: list[str] = []
+    degradable = sorted(
+        (group for group in groups if group.rank is not None and group.lines),
+        key=lambda group: group.rank,
+    )
+    for group in degradable:
+        if fits():
+            break
+        line_count = sum(line.count("\n") + 1 for line in group.lines)
+        pointer = f"{group.name}: {line_count} lines omitted — {where}"
+        if len(pointer) < sum(len(line) + 1 for line in current[group.name]):
+            current[group.name] = [pointer]
+            dropped.append(group.name)
+    return dropped
+
+
+def render_stdout(groups: list[MsgGroup], resumed: bool, overflow_file: Path) -> str:
+    """The hook's stdout, kept under STDOUT_BUDGET with a meter line last.
+
+    Over budget: the full text goes to `overflow_file` (best effort); every
+    line is clipped to _LINE_CAP; degradable groups shrink to a pointer,
+    lowest rank first, only while that helps; alert groups never degrade. If
+    it still does not fit, the body is cut from the end on a line boundary.
+    The meter names whatever was dropped or cut.
+    """
+    header = f"Session {'resumed' if resumed else 'started'}.\nBrief written to {BRIEF_FILE}."
+    footer = _stdout_footer()
+    limit = STDOUT_BUDGET - _METER_RESERVE
+
+    def assemble(body: list[str]) -> str:
+        return "\n".join([header, *body, "", footer])
+
+    full = assemble([line for group in groups for line in group.lines])
+    if len(full) <= limit:
+        _clear_overflow(overflow_file)
+        return f"{full}\nstdout: {len(full):,} / {STDOUT_BUDGET:,} chars"
+
+    saved = _write_overflow(overflow_file, full)
+    where = f"full text in {overflow_file}" if saved else "full text unavailable (overflow write failed)"
+    current = {group.name: [_clip(line) for line in group.lines] for group in groups}
+    clipped = any(len(line) > _LINE_CAP for group in groups for line in group.lines)
+
+    def body_lines() -> list[str]:
+        return [line for group in groups for line in current[group.name]]
+
+    dropped = _degrade(groups, current, lambda: len(assemble(body_lines())) <= limit, where)
+
+    body = body_lines()
+    truncated = False
+    while body and len(assemble(body)) > limit:
+        body.pop()
+        truncated = True
+    out = assemble(body)
+
+    notes = []
+    if clipped:
+        notes.append("lines clipped")
+    if dropped:
+        notes.append(f"dropped: {', '.join(dropped)}")
+    if truncated:
+        notes.append("body truncated")
+    meter = f"stdout: {len(out):,} / {STDOUT_BUDGET:,} chars — {'; '.join(notes)}, {where}"
+    return f"{out}\n{meter}"
 
 
 def main():
@@ -850,8 +1626,13 @@ def main():
     # Evolve check — count instincts, nudge every N sessions
     evolve_msgs = evolve_check(state)
 
-    # Config sync — warn if behind Codeberg
-    config_sync_msgs = config_sync_check()
+    # Config sync — warn if behind the remote, if live hooks are off the
+    # configured branch, if the config checkout holds untracked files, if the
+    # global secret scan is not running, or if a configured canary went stale
+    config_sync_msgs = (
+        config_sync_check() + live_hooks_branch() + config_untracked()
+        + secret_scan_status() + canary_liveness()
+    )
 
     # Dedup warning — detect dot-vs-hyphen encoding duplicates
     dedup_msgs = dedup_warning()
@@ -859,34 +1640,28 @@ def main():
     # Brain check — verify Supabase connectivity
     brain_msgs = brain_check()
 
+    # Deployed-hook drift — silent unless CRAFT_CONFIG_REPO is set
+    hook_msgs = hook_drift()
+
     write_state(state)  # persist updated counters
 
     brief = build_brief(state, resumed)
     BRIEF_FILE.parent.mkdir(parents=True, exist_ok=True)
     BRIEF_FILE.write_text(brief)
 
-    # Output instructions for Claude via stdout
-    # Claude Code passes hook stdout as context
-    all_msgs = (
-        sync_msgs
-        + decay_msgs
-        + evolve_msgs
-        + config_sync_msgs
-        + dedup_msgs
-        + brain_msgs
+    # Output instructions for Claude via stdout, bounded under the hook cap.
+    # Output order is unchanged; `rank` is the degradation order — cheapest to
+    # lose first. Correctness alerts are never degradable.
+    groups = build_groups(
+        sync=sync_msgs,
+        decay=decay_msgs,
+        evolve=evolve_msgs,
+        config=config_sync_msgs,
+        dedup=dedup_msgs,
+        brain=brain_msgs,
+        hook_drift=hook_msgs,
     )
-    sync_output = "\n".join(all_msgs) if all_msgs else ""
-    print(
-        f"""
-Session {"resumed" if resumed else "started"}.
-Brief written to {BRIEF_FILE}.
-{sync_output}
-
-Read {BRIEF_FILE} and present a session orientation (max 10 lines).
-Lead with the most actionable item: pending items > dirty repos > last session gap.
-If everything is clean, say so briefly. Tone: oriented co-pilot, not a greeter.
-""".strip()
-    )
+    print(render_stdout(groups, resumed, STDOUT_OVERFLOW_FILE))
 
 
 if __name__ == "__main__":

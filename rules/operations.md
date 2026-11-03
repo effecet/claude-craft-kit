@@ -6,13 +6,34 @@
 
 ## Proposal Gate
 
+### ONE approval per unit of work
+
+**A unit of work gets at most two pauses: one where the approach is decided, one before it reaches shared state.** Everything between them flows.
+
+This is the rule that keeps getting violated by accumulation — no single gate is wrong, but a brainstorm gate, a proposal gate, a memory-write gate and a push gate on one small change is four round-trips for one decision, and it reads as running in circles.
+
+| Moment | Pause? |
+|---|---|
+| Deciding the approach (Full tier only — Skip/Light states its intent in a sentence and proceeds) | ✅ once |
+| Implementing, testing, editing, refactoring within the approved approach | ❌ flow |
+| Committing | ❌ flow (see § Commits flow vs pushes pause) |
+| Writing or updating memories | ❌ flow — the dual-write is bookkeeping, not a decision |
+| Reaching shared state: push, merge, deploy, remote DB, external API with side effects | ✅ every time |
+| Anything destructive or irreversible | ✅ every time |
+
+**Do not re-ask for something already approved in the same unit of work.** If the user approved the design, they approved the edits the design described. If they said "go", the next pause is the push — not the next file.
+
+**When you would ask a second time, decide instead** and say what you decided in one line. If it turns out wrong the user can see it and undo it; a session parked on a question they already effectively answered costs more than a wrong call they can correct.
+
+### What still requires an explicit pause
+
 Before executing any of the following, always present a plan and wait for explicit approval:
-- File writes, renames, or deletions (destructive ops like `rm` always need approval — see § Destructive Operations)
+- File **deletions, renames, or overwrites of content you did not just write** (destructive ops like `rm` always need approval — see § Destructive Operations). Creating and editing files inside an approved unit of work does NOT pause — that was the approval.
 - Git **pushes**, force-pushes, branch deletes, or other shared-state operations (see § Git — commits flow vs pushes pause)
 - Deploy commands
 - Package installs
-- API calls with side effects (including MCP tools with mutation)
-- Database mutations (any local or remote DB)
+- **External** API calls with side effects — anything another person or machine can see: opening/merging a PR, filing or editing an issue, posting a message, publishing. MCP calls whose only effect is on your own memory store (`remember`, `update`, `pending_add`, `pending_resolve`) do NOT pause; they are bookkeeping inside the unit of work.
+- Database mutations against **shared** databases (any remote DB). A local throwaway dev DB does not pause — it is scratch, and idempotent migrations against it are part of implementing.
 - Anything in a production environment
 
 Format:
@@ -129,6 +150,16 @@ Destructive local ops (rm, file deletion, force-overwrite) still need explicit a
 ### Pre-Push Checks (always run before proposing a push)
 
 0. **Doc-hygiene gate (do this first).** Before proposing any push, verify docs, READMEs, badges, and diagrams reflect what's being pushed — run the `project-hygiene.md` § Post-Work checklist. The push is the last cheaply-reversible moment; don't push docs that lie. Pay special attention to badges: CI/workflow status badges break silently when a workflow is renamed or removed, and version badges (node, language, DB) drift on stack bumps.
+0b. **CI-shaped run — when the push changes tests, or code that reads config, env vars or dotfiles.** Local runs and reviewer agents all share this machine's gitignored files (`.env*`, caches, deployed copies), so a test that silently reads one passes everywhere except CI. Reproduce CI's checkout, which holds tracked files only:
+
+   ```bash
+   WT=$(mktemp -d "${TMPDIR:-/tmp}/ci-repro.XXXXXX")
+   git archive HEAD | tar -x -C "$WT"       # committed state; copy in any uncommitted files under test
+   (cd "$WT" && env -u DATABASE_URL -u <other vars CI lacks> <test command>)
+   rm -rf "$WT"
+   ```
+
+   Use `git archive`, not `git worktree add`: in the Claude Code sandbox a worktree registers only halfway, and removing it needs the sandbox off. **Expect failures with unrelated causes**, because the copy has no `node_modules` or `.venv`, so anything shelling out to tsx/npx fails there. Compare against the same suite in the main checkout, and treat as real only the failures that pass there and fail here for a config, env or file reason. A test that silently read a gitignored `.env` through a fallback chain can pass every local and reviewer run, then fail on the first CI run.
 1. `git fetch --quiet origin <branch>` — refresh remote refs
 2. `git log HEAD..origin/<branch> --oneline` — list remote commits we don't have locally
 3. If non-empty → `git pull --no-rebase -X ours origin <branch>` FIRST, then propose the push

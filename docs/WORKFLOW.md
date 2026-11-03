@@ -44,7 +44,6 @@ Fire **before** a tool call lands, and can block it:
 - `pr_security_scan.sh` — scans the branch diff before `gh pr create`.
 - `ruff_workflow_guard.py` — runs `ruff check` before committing in CI repos.
 - `prd_guard.sh` — warns before editing prod-looking paths.
-- `memory_name_guard.py` — enforces a memory-naming convention (≤5-word names).
 
 ### 4. The tiered validation gate — `validate_tier.py`
 After code changes, this script reads the diff and recommends a review tier instead

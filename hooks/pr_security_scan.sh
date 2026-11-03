@@ -58,9 +58,10 @@ fi
 
 echo "Running pre-PR security scan (diff against $BASE_BRANCH)..." >&2
 
-# Run gitleaks on the commit range between merge-base and HEAD
-RESULT=$(gitleaks detect --log-opts="$MERGE_BASE..HEAD" $GITLEAKS_OPTS 2>&1) || true
-EXIT_CODE=$?
+# Run gitleaks on the commit range between merge-base and HEAD.
+# NOTE: `cmd || true` would make $? always 0 (it captures `true`, not gitleaks),
+# silently disabling this guard. Capture the real status in the else-branch.
+RESULT=$(gitleaks detect --log-opts="$MERGE_BASE..HEAD" $GITLEAKS_OPTS 2>&1) && EXIT_CODE=0 || EXIT_CODE=$?
 
 if [ $EXIT_CODE -ne 0 ]; then
   echo "" >&2

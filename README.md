@@ -31,9 +31,8 @@ flowchart TD
     E --> F[PreToolUse guards]
     F -->|Bash: git commit / gh pr| G[gitleaks · pr_security_scan · ruff_workflow_guard]
     F -->|Write/Edit| H[prd_guard<br/>warn on prod paths]
-    F -->|memory write| I[memory_name_guard<br/>keep memory names concise]
-    G & H & I --> J[/Tiered validation gate<br/>validate_tier.py/]
-    J -->|Skip| K[config/docs only]
+    G & H --> J[/Tiered validation gate<br/>validate_tier.py/]
+    J -->|Skip| K[docs only · zero effective LOC]
     J -->|Light| L[2 reviewers · <30 LOC]
     J -->|Full| M[6 reviewers · sensitive paths / features]
     K & L & M --> N{More work?}
@@ -54,17 +53,16 @@ See **[docs/WORKFLOW.md](docs/WORKFLOW.md)** for the full walkthrough and the va
 
 | Stage | Hook | Does |
 |---|---|---|
-| SessionStart | `session_start.py` | Init/resume session state, git context, surface open specs + pending work |
+| SessionStart | `session_start.py` | Init/resume session state, git context, open specs + pending work; optional checks (deployed-hook drift, live-hooks branch, untracked config, stale canary, secret-scan hook) via `config.example.sh`; output kept under the 10k hook cap |
 | SessionStart | `mcp_restore_guard.py` | Self-heal: re-register local stdio MCP servers that got dropped from `~/.claude.json` (opt-in via `mcp-restore.json`) |
 | UserPromptSubmit | `track.py`, `consume_prompt.py` | Message counting, token report, friction/goodbye detection, pending prompts |
 | PreToolUse | `gitleaks_guard.sh`, `pr_security_scan.sh` | Block commits/PRs that leak secrets |
 | PreToolUse | `prd_guard.sh` | Warn before editing prod-looking paths |
 | PreToolUse | `ruff_workflow_guard.py` | Ruff check before committing in CI repos |
-| PreToolUse | `memory_name_guard.py` | Keep memory names concise (optional convention hook) |
 | (gate) | `validate_tier.py` | Pick the review tier from diff size + sensitive paths |
 | Stop | `stop_gate.py` | Block a clean exit until wrap-up runs on substantial sessions |
 | idle | `on_idle.sh` | Nudge a wrap-up after inactivity |
-| helpers | `_state.py`, `common.py`, `spec_audit.py` | Shared state schema, path helpers, spec reporting |
+| helpers | `_state.py`, `common.py`, `shell_words.py`, `spec_audit.py` | Shared state schema, path helpers, shell-command parsing, spec reporting |
 
 **Rules** (`rules/`) — the behavior the hooks enforce: `development.md` (the
 validation gate + TDD), `operations.md` (proposal gate, git safety), `memory.md`,
@@ -134,11 +132,11 @@ claude-craft-kit/
 │   ├── pr_security_scan.sh     # PreToolUse: secret scan before PR
 │   ├── prd_guard.sh            # PreToolUse: prod-path warning
 │   ├── ruff_workflow_guard.py  # PreToolUse: ruff before commit
-│   ├── memory_name_guard.py    # PreToolUse: memory-name convention
 │   ├── on_idle.sh              # idle: wrap-up nudge
 │   ├── spec_audit.py           # report open specs
 │   ├── _state.py               # session-state schema
 │   ├── common.py               # path + connection-string helpers
+│   ├── shell_words.py          # shell-command parsing for the guards
 │   └── optional/               # backend-coupled, BRAIN_ENABLED=false by default
 │       ├── proactive_recall.py # surface relevant memories per prompt
 │       └── backup_hook.py      # generic git backup of your config
