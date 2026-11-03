@@ -36,6 +36,20 @@ After implementing code and before proposing a commit, run this checklist:
 
 Skip steps 1-2 if the change only modifies file contents without structural impact (bug fixes, config value tweaks, test additions).
 
+### Tag unverified claims in docs
+
+A prediction written in the same bold ⚠️ register as a measurement becomes indistinguishable from one once committed, and nothing ever re-tests it. When a doc, CLAUDE.md entry, commit body or memory states something you did not observe, tag it with **what would settle it**:
+
+    ⟨UNVERIFIED: run `diff ~/.claude/hooks/X hooks/X` on the other machine⟩
+
+Tag these:
+- Any claim about a machine you are not on ("the server's copy is still the old one").
+- Any causal explanation of a symptom you did not reproduce where the code actually runs.
+- Any "X is probably still Y" or "expect Z after pulling".
+
+When you settle one, replace the tag with the result and the date (`verified 2026-10-11: byte-identical`). Never just delete the tag. To sweep, `grep -rn "UNVERIFIED:"` across the repo and its memories, then resolve or re-tag each hit.
+
+
 ---
 
 ## Phased Plan Tasks

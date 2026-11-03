@@ -35,11 +35,18 @@ Batch comma-separated in a single call — the schemas persist for the rest of t
 ToolSearch(query="select:mcp__memory-persistor__remember,mcp__memory-persistor__recall", max_results=10)
 ```
 
+**The failure is SILENT for `remember`/`update`.** It does not error — `observations`
+is declared a **string**, so a JSON array passed without the schema loaded is coerced
+to its literal text and stored. You get a normal success envelope while the memory
+body becomes one line of `["...","..."]`, and its index line starts with `["`.
+Pre-load before the first memory write of any session.
+
 **Skip when:** you've already pre-loaded that tool this session, OR you're certain you won't call it (don't speculate — pre-loading speculatively wastes a tool call).
 
 **Why this exists:** the first-call failure is misleading — the harness returns a generic type error, sending you into a parameter-debugging rabbit hole on what is actually a "schema not loaded yet" problem. Pre-loading is one cheap call that prevents the whole failure mode.
 
 ---
+
 
 ## Python tooling (python-enhancer MCP)
 
@@ -58,7 +65,24 @@ When the post-step validation gate runs on a diff that touches any `*.py` file, 
 
 **Skip conditions (explicit):**
 - Light tier gate — skip `deps_audit` and `security`; keep `lint` + `typecheck`
-- Skip tier (config/docs only) — skip all four
+- Skip tier (docs only, non-sensitive config only, or a diff with zero effective LOC — comments, blank lines and prose only) — skip all four
+
+**What to do when it is missing.** If the tools are absent from a session, **do not skip the Python half
+of the gate silently** — that is the failure this note exists to prevent. Fall
+back to the repo's own linter, invoked exactly the way its CI invokes it, and
+say so in the validation report and the commit body:
+
+```
+python-enhancer MCP is not connected on this host, so the Python half of the
+gate ran through the repo's own ruff -- the same invocation CI uses. Strict-set
+findings are unchanged from main.
+```
+
+Then compare findings against the base branch rather than reading the raw count:
+a repo with pre-existing lint debt will look alarming otherwise. The bar is "my diff adds
+none", not "the file is clean". Before assuming absence, run
+`claude mcp get python-enhancer` — one command, and it distinguishes
+"not registered" from "registered but not loaded this session".
 
 **Hook-code ignore list (for hook scripts under `~/.claude/hooks/**`):** When invoking `python_lint` on local hook code, pass `ignore=S603,S607,S110,PTH123,PTH109,E741`. These are documented false positives for private-harness hook code:
 - `S603` / `S607` — subprocess calls with list args (never shell=True), partial executable paths on system tools (`git`, `make`, `python3`). Not an attack surface; flagged ~30 times per hook file.
@@ -67,6 +91,50 @@ When the post-step validation gate runs on a diff that touches any `*.py` file, 
 - `E741` — ambiguous variable name `l` in short loop comprehensions. Style nit, not an error risk at hook scope.
 
 The ignore list applies ONLY to hook code (`~/.claude/hooks/`). Application code, data-engineering pipelines, and anything non-hook gets the full ruleset with no ignores. Rationale: hook lint runs return 25-50 issues per file, all from this list — cutting them at the source preserves signal for real issues.
+
+**`python_lint` WRITES TO YOUR FILES.** Its contract is "auto-fixes safe issues
+in-place and returns remaining problems" — so the gate's own lint step mutates
+the tree it is reviewing — a run can silently delete unused imports. Consequences, in order of how badly they bite:
+
+1. **Stage before you lint.** `git add -A` before the gate already covers this
+   (see `rules/development.md` § Reviewer agents mutate the SHARED working
+   tree) — the same index that separates an agent's mutation from your own also
+   separates ruff's autofix from your own.
+2. **Diff after every lint run**, and read the fixes before committing them. An
+   autofix is an edit you did not write and did not review; "safe" is ruff's
+   judgement of syntax, not of your intent.
+3. **Never run it concurrently with reviewer agents.** Two writers on one tree
+   is how an agent's mutation gets mistaken for your own edit and committed.
+   Lint first, read the diff, THEN dispatch the agents.
+
+`python_format` writes in-place too, by design — that one is expected, and is
+already scheduled at commit time rather than review time. `python_typecheck`,
+`python_security`, `python_complexity` and `python_deps_audit` are read-only.
+
+**`select` and `ignore` may not be ruff's flags.** One python-enhancer build
+accepted both parameters and did not honour them the way `ruff check` does.
+Measured on one script with identical arguments (`select=E,F,S,B,I,PTH`,
+`ignore=S603,S607,S110,PTH123,PTH109,E741`):
+
+| | `ruff check` (same flags) | `python_lint` MCP |
+|---|---|---|
+| findings | 4 — `E501`, `PTH101`, `PTH105`, `S310` | 13 |
+| `select` respected | yes | **no** — returned `RUF100`, `RUF001`, `SIM105`, none of which are in the select set |
+| `ignore` respected | yes | **no** — returned `S603`, which was explicitly ignored |
+| fix counter | coherent | `found 4, auto-fixed -9, remaining 13` |
+
+**This defeats the hook-code ignore list above.** Passing `ignore=...` to the
+MCP does not suppress those rules, so a gate run on hook code still surfaces the
+false positives that list exists to cut. Until the server is fixed:
+
+- Treat the MCP's output as a **superset** — read it for signal, but do not
+  report its raw count as the finding count.
+- When the ignore list matters (hook code) or when the number itself matters
+  (comparing a diff against a base branch), **shell out to the repo's own ruff**
+  with the exact flags and use that as the number of record. The MCP's value is
+  the rule links and the autofix, not the arithmetic.
+- The negative fix count means "auto-fixed" cannot be trusted either — always
+  `git diff` after a lint run to see what actually changed.
 
 ### `python_complexity` as a soft gate
 

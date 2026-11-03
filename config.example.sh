@@ -36,3 +36,30 @@ export BACKUP_REMOTE="origin"
 export BACKUP_BRANCH="main"
 # Optional DB dump alongside the git backup (unset = skipped):
 # export BACKUP_DB_URL="postgresql://..."
+
+# ---- Optional session-brief checks (all OFF until set) ----------------------
+# session_start.py can warn about problems that otherwise stay silent. Each
+# check below does nothing unless its setting is present.
+#
+# CRAFT_CONFIG_REPO turns on three checks. Deployed-hook drift: compare
+# ~/.claude/hooks and ~/.claude/scripts with the git checkout they come from, and say which copies are AHEAD (local forks —
+# upstream them before copying), stale, or diverged.
+# export CRAFT_CONFIG_REPO="${HOME}/code/claude-craft-kit"
+# Subdirectory of that checkout holding hooks/ and scripts/ (unset = root):
+# export CRAFT_CONFIG_SUBDIR=""
+# Basenames you keep as deliberate per-machine forks (comma-separated):
+# export CRAFT_HOOK_DRIFT_EXCLUDE=""
+#
+# Live-hooks branch + untracked config (also enabled by CRAFT_CONFIG_REPO):
+# when ~/.claude/hooks is a symlink into that checkout, warn if it is not on
+# this branch, or has untracked files.
+# export CRAFT_CONFIG_BRANCH="main"
+#
+# Stale heartbeat: a scheduled job writes `date +%s` to this file every run;
+# warn when it is older than CRAFT_CANARY_MAX_AGE_H hours.
+# export CRAFT_CANARY_FILE="${HOME}/.claude/session/canary_last_run"
+# export CRAFT_CANARY_MAX_AGE_H="3"
+#
+# Secret scan: the global git hooks dir core.hooksPath must point at (the
+# check also verifies a recent enough gitleaks is installed).
+# export CRAFT_GIT_HOOKS_DIR="${HOME}/.claude/git-hooks"

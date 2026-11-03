@@ -29,6 +29,7 @@ def make_fresh_state(preserved: dict | None = None) -> dict:
         # Wrap-up flags
         "wrap_up_ran": False,
         "wrap_up_prompted": False,
+        "stop_gate_prompted": False,
         "threshold_prompted": False,
         "idle_prompted": False,
         "last_idle_trigger": 0,

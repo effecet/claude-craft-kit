@@ -17,16 +17,24 @@ action only — don't try via Bash).
 
 ## In-session workaround (no sudo)
 
-Point npm at a fresh, writable cache directory under `$TMPDIR`:
+Point npm at a fresh, writable cache directory in a temp location:
 
 ```bash
-npm install --cache "$TMPDIR/npm-cache-$$"
-npm audit --cache "$TMPDIR/npm-cache-$$"
-npx --cache "$TMPDIR/npm-cache-$$" <command>
+# Portable: ${TMPDIR:-/tmp} falls back to /tmp when TMPDIR is unset (Linux)
+npm install --cache "${TMPDIR:-/tmp}/npm-cache-$$"
+npm audit --cache "${TMPDIR:-/tmp}/npm-cache-$$"
+npx --cache "${TMPDIR:-/tmp}/npm-cache-$$" <command>
 ```
 
-`$$` is the current PID — gives a unique dir per invocation. `$TMPDIR` is
-sandbox-writable. No permission errors, no sudo, no system changes.
+`$$` is the current PID — gives a unique dir per invocation. No permission
+errors, no sudo, no system changes.
+
+**Linux caveat:** `$TMPDIR` is a macOS convention and is usually **unset on
+Linux**. A bare `"$TMPDIR/npm-cache-$$"` then expands to `/npm-cache-$$` — a
+root-owned path at filesystem root — and npm fails with the same EPERM/`mkdir`
+error you were trying to avoid. Always use the `${TMPDIR:-/tmp}` form above, or
+pass an explicit writable dir. The caveat is not npm-specific; see
+`rules/development.md` § Shell — `$TMPDIR` is not guaranteed.
 
 Applies to: `npm install`, `npm audit`, `npm audit fix`, `npm view`, `npx`,
 and any other command that writes to the cache.

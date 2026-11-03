@@ -21,9 +21,6 @@
       ] },
       { "matcher": "Write|Edit", "hooks": [
         { "type": "command", "command": "bash ~/.claude/hooks/prd_guard.sh" }
-      ] },
-      { "matcher": "mcp__memory__remember", "hooks": [
-        { "type": "command", "command": "python3 ~/.claude/hooks/memory_name_guard.py" }
       ] }
     ],
     "Stop": [

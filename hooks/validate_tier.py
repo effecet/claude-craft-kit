@@ -23,6 +23,7 @@ Exit codes:
 
 import json
 import re
+from pathlib import Path
 import subprocess
 import sys
 
@@ -86,27 +87,67 @@ SENSITIVE_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("rls", _bounded("rls")),
 ]
 
+# The harness's SessionStart lifecycle hook and its tests: `_` is a segment
+# boundary, so `session` matched the filename and every edit to one of the
+# most-edited hooks cost a 6-agent Full gate. Anchored to the hooks dir
+# itself (this kit's root `hooks/`, or a `.claude/hooks/`) — `src/session_start.py`
+# still escalates. The
+# names are listed, not wildcarded: an exempt path skips EVERY pattern, so
+# `session_start_token.py` must not ride along. A new name escalates.
+_SESSION_START_HOOK = re.compile(
+    r"(^(hooks/session_start|tests/test_session_start(_hook_drift|_budget|_canary_liveness|_config_untracked|_live_hooks|_secret_scan)?)"
+    r"|(^|/)\.claude/hooks/(session_start|tests/test_session_start(_hook_drift|_budget|_canary_liveness|_config_untracked|_live_hooks|_secret_scan)?))\.py$"
+)
+
+# Exempt paths whose CONTENT still escalates. session_start.py really does hold
+# credential plumbing (the optional memory backend's DSN handling), so the `session` filename hit was
+# accidentally right for it: a changed line — added OR deleted — that touches
+# that plumbing reports `credential-content` and goes Full.
+CONTENT_GUARDED_EXEMPT_PATHS: list[re.Pattern[str]] = [_SESSION_START_HOOK]
+CREDENTIAL_CONTENT_RE = re.compile(
+    r"psql|dsn|database_url|pgpassword|password|secret|token|credential|\.env\b"
+    r"|connection_string|\bconn\b|\benv\s*=",
+    re.IGNORECASE,
+)
+
 # File-level exemption (different from `.env`-style in-pattern lookahead in
 # SENSITIVE_PATTERNS): an exempt path is dropped from ALL sensitive checks,
 # not just one. Each entry must be paired with tests proving the false
 # positive is cured AND a near-miss path still escalates.
 SENSITIVE_EXEMPT_PATHS: list[re.Pattern[str]] = [
     re.compile(r"(^|/)\.claude/session/[^/]+\.json$"),
-    re.compile(r"(^|/)claude-config/skills/skillgenome/session-log\.json$"),
     # Calendar/booking session files (schedule-session.*, booking-session.*,
     # calendar-session.*) are NOT auth sessions and must not trigger the
     # `session` sensitive escalation. Example origin: a calendar availability
     # handler (schedule-session.js) once auto-escalated a 6-LOC CSS-class
     # rename to Full tier.
     re.compile(r"(^|/)(schedule|booking|calendar)-session\.[a-z]+$"),
+    _SESSION_START_HOOK,  # content-guarded — see CONTENT_GUARDED_EXEMPT_PATHS
 ]
 
 # Forbidden code markers — block before any gate runs
 FORBIDDEN_MARKERS = ["TODO", "FIXME", "FIX", "HACK", "TEMP", "XXX"]
 
+# Prose: read by people, never executed, so its lines — added OR deleted —
+# never count toward the tier, and its NAME is never a risk signal: docs/security.md
+# neither escalates a diff nor stops a docs-only one Skipping. Prose is decided by
+# extension alone; a non-prose file under docs/ still gets the sensitive check.
+# `.txt` is NOT here: requirements.txt pins
+# and CMakeLists.txt are real changes. Config (.yml, .json…) keeps counting too.
+# One pattern feeds both SKIP_PATTERNS and PROSE_RE so they cannot drift.
+_PROSE_PATTERN = r"(?i)\.(md|rst|adoc)$"
+PROSE_RE = re.compile(_PROSE_PATTERN)
+
+# Code extensions a docs/ or README path match must not swallow: docs/run.sh
+# and README_install.sh run, whatever directory or prefix they sit under.
+_NOT_CODE = (
+    r"(?!.*\.(?i:sh|bash|zsh|ps1|bat|cmd|py|ipynb|js|mjs|cjs|ts|tsx|jsx|vue|svelte"
+    r"|rb|pl|php|lua|go|rs|java|kt|c|h|cc|cpp|hpp|cs|swift|sql|tf)$)"
+)
+
 # Skip-tier file patterns: config / docs only — no testable code
 SKIP_PATTERNS = [
-    r"\.md$",
+    _PROSE_PATTERN,
     r"\.txt$",
     r"\.json$",
     r"\.yaml$",
@@ -116,37 +157,129 @@ SKIP_PATTERNS = [
     r"\.cfg$",
     r"\.gitignore$",
     rf"\.env[\w.\-]*\.({_TEMPLATE_ALT})$",
-    r"^docs/",
-    r"/docs/",
-    r"^README",
-    r"/README",
+    # Under docs/ only a file WITH an extension: an extensionless docs/bin/run
+    # is as likely a script as a page.
+    rf"(^|/)docs/{_NOT_CODE}.*\.\w+$",
+    rf"(^|/)README{_NOT_CODE}",
 ]
+
+# Build tooling: a diff touching ONLY these (plus docs/config) is capped at
+# Light — two reviewers, never six — but never Skip. A Makefile can leak a DSN
+# into argv, carry a load-bearing `set -e` or run every migration; none of
+# those defects fails a `make` run. Anchored to the
+# whole basename, so `Makefile.generator.py` does not match. `pyproject.toml`
+# is deliberately absent: it can carry [project] / [build-system] pins. Build
+# files stay IN the forbidden-marker scan, unlike SKIP_PATTERNS.
+BUILD_PATTERNS = [
+    r"(^|/)(GNU)?[Mm]akefile$",
+    r"(^|/)[Jj]ustfile$",
+    r"(^|/)Taskfile\.ya?ml$",
+    r"\.mk$",
+]
+
+# Lockfiles: machine-written, so a reviewer reads them for one thing — a
+# tampered `resolved` URL or hash changes what gets installed. Never Skip, but
+# capped at Light like build tooling, and their lines are not effective LOC:
+# an `npm audit fix` rewrites thousands of lines and must not cost six
+# reviewers. Not marker-scanned. Named, not `*.lock`: `src/evil.lock` is code.
+LOCKFILE_PATTERNS = [
+    r"(^|/)(package-lock|npm-shrinkwrap)\.json$",
+    r"(^|/)pnpm-lock\.ya?ml$",
+    r"(^|/)(uv|yarn|poetry|Cargo|Gemfile|composer|Pipfile|bun|flake)\.lock$",
+]
+CAP_PATTERNS = BUILD_PATTERNS + LOCKFILE_PATTERNS
+
+# Executable config: a skip pattern matches the extension, but the content runs
+# (CI `run:` blocks, hook commands and `permissions.allow`, npm scripts, MCP
+# spawn commands, compose services) or decides what is scanned and installed
+# (the gitleaks allowlist, dependency pins). Light FLOOR, not a cap: beside code
+# the LOC threshold still applies.
+CI_WORKFLOW_PATTERNS = [
+    r"(^|/)\.(github|forgejo|gitea)/workflows/[^/]+\.ya?ml$",
+    r"(^|/)\.gitlab-ci\.ya?ml$",
+    r"(^|/)\.woodpecker(\.ya?ml$|/[^/]+\.ya?ml$)",
+    r"(^|/)action\.ya?ml$",  # composite actions: shell a workflow runs
+]
+EXEC_CONFIG_PATTERNS = [
+    *CI_WORKFLOW_PATTERNS,
+    r"(^|/)settings(\.local)?\.json$",
+    r"(^|/)hooks/[^/]+\.json$",
+    r"(^|/)(package|composer)\.json$",
+    r"(^|/)pyproject\.toml$",
+    r"(^|/)mcp/[^/]+\.json$",
+    r"(^|/)\.mcp\.json$",
+    r"(^|/)(docker-)?compose(\.[\w-]+)?\.ya?ml$",
+    r"(^|/)\.pre-commit-config\.ya?ml$",
+    r"(^|/)\.gitleaks\.toml$",
+    r"(^|/)requirements[\w.\-]*\.txt$",
+]
+
+# Instruction prose: loaded into every session as instructions, so deleting the
+# push gate from rules/operations.md is a behaviour change, not a doc edit.
+# Prose counts 0 effective LOC, so for these the floor is also the ceiling.
+INSTRUCTION_PATTERNS = [
+    r"(^|/)(CLAUDE(\.local)?|AGENTS|SKILL)\.md$",
+    r"^(rules|agents|commands|skills)/.+\.md$",  # this kit's own layout
+    r"(^|/)\.claude/(rules|agents|commands|skills)/.+\.md$",
+]
+
+# Never Skip. Build files and lockfiles are additionally CAPPED at Light
+# (only_capped_and_skippable).
+LIGHT_FLOOR_PATTERNS = CAP_PATTERNS + EXEC_CONFIG_PATTERNS + INSTRUCTION_PATTERNS
+
+# A changed workflow line that widens what the job may do or reach → Full: a
+# `permissions:` block or a scope inside one, any reference to `secrets`
+# (`secrets.X`, `secrets['X']`, `toJSON(secrets)`, `secrets: inherit`), the
+# job token, OIDC, or a trigger that runs fork code with secrets.
+CI_ESCALATE_RE = re.compile(
+    r"^\s*permissions\s*:|^\s*[\w-]+\s*:\s*[\"']?write(-all)?[\"']?\s*(#.*)?$|\bsecrets\b"
+    r"|\bgithub\.token\b|\bid-token\b|\bpull_request_target\b"
+)
+
+
+def _matches(path: str, patterns: list[str]) -> bool:
+    return any(re.search(p, path) for p in patterns)
+
+
+# Comment syntax by file type (see _comment_mask). Unknown types never discount.
+_HASH_RE = re.compile(
+    r"\.(py|pyi|sh|bash|zsh|rb|pl|r|toml|ya?ml|cfg|ini|mk)$"
+    r"|(^|/)((GNU)?[Mm]akefile|[Jj]ustfile|Dockerfile)$"
+)
+_SLASH_RE = re.compile(r"\.(ts|tsx|js|jsx|mjs|cjs|go|rs|java|kt|c|h|cc|cpp|hpp|cs|swift|scss|css)$")
+_SQL_RE = re.compile(r"\.sql$")
 
 # Marker-scan exemptions: files that legitimately contain forbidden marker
 # strings as DATA (not as leftover code markers). validate_tier.py defines the
-# marker list; its test file uses them as fixture input. Both would otherwise
+# marker list; its test files use them as fixture input. Both would otherwise
 # cause the scanner to block on itself. Distinct from SKIP_PATTERNS because
 # these files ARE real code and should affect tier selection normally.
 MARKER_SCAN_EXEMPT = [
     r"(^|/)validate_tier\.py$",
     r"(^|/)test_validate_tier\.py$",
+    r"(^|/)(hooks/)?tests/test_validate_tier_[a-z_]+\.py$",
 ]
 
 LIGHT_THRESHOLD = 30  # LOC — boundary between Light and Full tiers
 
+# Pinned so a user's git config cannot change the text parsed below:
+# diff.noprefix / mnemonicPrefix would rename every header, an external diff
+# driver or colour would replace the format, and quotePath would hide paths.
+_GIT_DIFF_OPTS = [
+    "-c", "core.quotePath=off", "diff",
+    "--no-ext-diff", "--no-color", "--src-prefix=a/", "--dst-prefix=b/",
+]
 
-def get_diff(scope: str) -> tuple[list[str], dict[str, list[str]], int]:
-    """Return (changed_files, added_lines_by_file, total_loc_changed).
 
-    added_lines_by_file maps each file path to the list of added lines from
-    that file. Files are listed in the order they appear in the diff.
+def _git_diff(extra: list[str]) -> str:
+    """Run the pinned `git diff` with `extra` appended.
+
+    The literal "git" argv[0] means it can only ever run `git diff`.
     """
-    if scope == "--staged":
-        cmd = ["git", "diff", "--staged"]
-    else:
-        cmd = ["git", "diff", scope]
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        proc = subprocess.run(
+            ["git", *_GIT_DIFF_OPTS, *extra], capture_output=True, text=True, check=True
+        )
     except FileNotFoundError:
         print("error: git not found in PATH", file=sys.stderr)
         sys.exit(1)
@@ -156,30 +289,280 @@ def get_diff(scope: str) -> tuple[list[str], dict[str, list[str]], int]:
             file=sys.stderr,
         )
         sys.exit(1)
+    return proc.stdout
+
+
+UNKNOWN_PATH = "<unknown path>"
+
+# (sign, path) → indexes into added[path] / deleted[path] where a run of
+# CONSECUTIVE changed lines begins. Filled by get_diff, read by _comment_mask:
+# block-comment state must not span unchanged lines, or the opener of one doc
+# comment pairs with the closer of another and masks the code between them.
+RUN_STARTS: dict[tuple[str, str], set[int]] = {}
+
+
+def _header_path(line: str, prefix: str) -> str | None:
+    """The path in a `--- a/x` / `+++ b/x` header, or None for /dev/null.
+
+    Git C-quotes a path containing `"`, `\\`, a tab or a newline even with
+    core.quotePath=off (`+++ "b/we\\"ird.py"`). Missing that dropped every line
+    of such a file from the count, so 41 lines of exec() scored Skip.
+    """
+    rest = line[4:].rstrip("\t")
+    if rest.startswith('"') and rest.endswith('"') and len(rest) >= 2:
+        raw = rest[1:-1].encode("latin-1", "backslashreplace")
+        try:
+            rest = raw.decode("unicode_escape").encode("latin-1").decode("utf-8")
+        except (UnicodeDecodeError, UnicodeEncodeError):
+            return UNKNOWN_PATH
+    if rest.startswith(prefix):
+        return rest[len(prefix):]
+    return None
+
+
+def get_diff(
+    scope: str,
+) -> tuple[list[str], dict[str, list[str]], int, dict[str, list[str]]]:
+    """Return (changed_files, added_lines_by_file, total_loc_changed, deleted_lines_by_file).
+
+    The FILE LIST comes from `--name-status -z -M`, not from patch headers: a
+    pure rename or a binary change has no `---`/`+++` lines at all, and a file
+    list read from headers silently dropped them (an empty list is Skip). Both
+    sides of a rename are listed, so renaming INTO a sensitive path escalates.
+
+    LINE CONTENT comes from the patch, parsed with header state: `---`/`+++` are
+    headers only between `diff --git` and the first `@@`. Inside a hunk, a
+    deleted SQL comment `-- x` reads as `--- x` and an added `++ x` as `+++ x`;
+    treating those as headers dropped lines and re-attributed everything after
+    them to whatever path the fake header named.
+    """
+    scope_args = ["--staged"] if scope == "--staged" else [scope]
     files: list[str] = []
-    added: dict[str, list[str]] = {}
+    fields = _git_diff([*scope_args, "--name-status", "-z", "-M"]).split("\0")
+    i = 0
+    while i < len(fields) and fields[i]:
+        status = fields[i]
+        n_paths = 2 if status[:1] in ("R", "C") else 1
+        for path in fields[i + 1 : i + 1 + n_paths]:
+            if path and path not in files:
+                files.append(path)
+        i += 1 + n_paths
+
+    added: dict[str, list[str]] = {f: [] for f in files}
+    deleted: dict[str, list[str]] = {f: [] for f in files}
     loc = 0
     current: str | None = None
-    for line in proc.stdout.splitlines():
-        if line.startswith("+++ b/"):
-            current = line[6:]
-            files.append(current)
-            added.setdefault(current, [])
-        elif (
-            line.startswith("+") and not line.startswith("+++") and current is not None
-        ):
-            added[current].append(line[1:])
+    old: str | None = None
+    in_header = False
+    prev_sign = ""  # sign of the previous hunk line: "+", "-", or "" for context
+    RUN_STARTS.clear()  # module state: never carry one diff's runs into the next
+    for f in files:
+        RUN_STARTS.setdefault(("+", f), set())
+        RUN_STARTS.setdefault(("-", f), set())
+    for line in _git_diff(scope_args).splitlines():
+        if line.startswith("diff --git "):
+            in_header, current, old, prev_sign = True, None, None, ""
+        elif in_header:
+            if line.startswith("@@"):
+                in_header = False
+            elif line.startswith("--- "):
+                old = _header_path(line, "a/")
+            elif line.startswith("+++ "):
+                # A deleted file's new side is /dev/null: attribute to the old path.
+                current = _header_path(line, "b/") or old
+        elif line.startswith("@@"):
+            prev_sign = ""
+        elif line.startswith(("+", "-")):
+            # Fail closed: a hunk line whose file could not be named still
+            # counts, under a placeholder no skip pattern matches.
+            target = current if current is not None else UNKNOWN_PATH
+            if target not in files:
+                files.append(target)
+            bucket = added if line[0] == "+" else deleted
+            lines_so_far = bucket.setdefault(target, [])
+            if prev_sign != line[0]:
+                RUN_STARTS.setdefault((line[0], target), set()).add(len(lines_so_far))
+            lines_so_far.append(line[1:])
+            prev_sign = line[0]
             loc += 1
-        elif line.startswith("-") and not line.startswith("---"):
-            loc += 1
-    return files, added, loc
+        else:
+            prev_sign = ""  # context line (or `\ No newline`) ends a run
+    return files, added, loc, deleted
+
+
+MIGRATION_RE = re.compile(r"(?:^|/)drizzle/\d+[^/]*\.sql$")
+
+
+def _sibling_migration_lines(exclude: set[str]) -> set[str]:
+    """Every stripped line already present in some OTHER committed migration."""
+    corpus: set[str] = set()
+    drizzle = Path.cwd() / "drizzle"
+    if not drizzle.is_dir():
+        return corpus
+    for path in drizzle.glob("*.sql"):
+        rel = f"drizzle/{path.name}"
+        if rel in exclude:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        corpus.update(line.strip() for line in text.splitlines() if line.strip())
+    return corpus
+
+
+def _comment_mask(path: str, lines: list[str], run_starts: set[int] | None = None) -> list[bool]:
+    """Per line: True if it is blank or comment-only for the file's language.
+
+    A line counts as a comment only when NOTHING executable is on it, so a
+    trailing comment after code is code. For C-style languages this tracks
+    block-comment state across the given lines instead of trusting a prefix:
+    `* evil()` outside a block is a multiplication continuation or a pointer
+    write, `*[Symbol.iterator]()` a generator, `/* x */ evil()` code after a
+    comment — prefix matching discounted all three. A block opened in unchanged
+    context is not seen, so its body counts as code: that errs toward review.
+
+    Accepted limit: this reads lines, not a parse tree, so a deliberate payload
+    inside a string whose lines begin with `#` or `//` would be discounted. The
+    gate reviews our own changes; it is not an adversarial boundary.
+    """
+    hash_lang = bool(_HASH_RE.search(path))
+    slash_lang = bool(_SLASH_RE.search(path))
+    sql = bool(_SQL_RE.search(path))
+    mask: list[bool] = []
+    in_block = False
+    block_start = 0
+
+    def uncomment_open_block(end: int) -> None:
+        # The block never closed inside its run: its `*/` is in unchanged
+        # context, so what follows the opening is unknown. Count it as code
+        # rather than mask it (edit the first line of an existing doc comment
+        # and every later added line vanished).
+        mask[block_start:end] = [not ln.strip() for ln in lines[block_start:end]]
+
+    for i, line in enumerate(lines):
+        if in_block and run_starts and i in run_starts:
+            uncomment_open_block(i)
+            in_block = False
+        s = line.strip()
+        if not s:
+            mask.append(True)
+        elif slash_lang:
+            if in_block:
+                close = s.find("*/")
+                if close >= 0:
+                    in_block = False
+                    mask.append(not s[close + 2 :].strip())
+                else:
+                    mask.append(True)
+            elif s.startswith("//"):
+                mask.append(True)
+            elif s.startswith("/*"):
+                close = s.find("*/", 2)
+                if close < 0:
+                    in_block, block_start = True, len(mask)
+                    mask.append(True)
+                else:
+                    mask.append(not s[close + 2 :].strip())
+            else:
+                mask.append(False)
+        elif hash_lang:
+            mask.append(s.startswith("#") and not s.startswith("#!"))  # a shebang is code
+        elif sql:
+            mask.append(s.startswith("--"))
+        else:
+            mask.append(False)
+    if in_block:
+        uncomment_open_block(len(lines))
+    return mask
+
+
+def loc_breakdown(
+    added: dict[str, list[str]], raw_loc: int, deleted: dict[str, list[str]] | None = None
+) -> dict[str, int]:
+    """raw_loc minus the lines no reviewer needs to read, itemised.
+
+      migration_copies — added `drizzle/NNNN_*.sql` lines copied verbatim from a
+        SIBLING migration. This repo supersedes a migration by reproducing it
+        (0014 is 0013 plus two lines); counted naively that escalated a ten-line
+        fix to Full. Never discounted against the file itself, so a genuinely new
+        migration still counts in full.
+      comments_blank — blank or comment-only lines, added or deleted (see
+        _comment_mask). One real line among 200 comments still counts as one.
+      prose — lines in .md/.rst/.adoc files, added or deleted.
+      lockfile — lines in a lockfile (LOCKFILE_PATTERNS), added or deleted:
+        machine-written, so 5,000 of them beside 5 lines of code must not
+        make the diff Full. The lockfile itself still lifts Skip to Light.
+
+    Deleted CODE is never discounted: a removed line is real work regardless of
+    where the text also appears. `effective` is the number the tier is judged
+    on and is what the JSON `loc` field reports; `raw` is `raw_loc`.
+    """
+    deleted = deleted or {}
+    migration_files = {f for f in added if MIGRATION_RE.search(f)}
+    corpus = _sibling_migration_lines(exclude=migration_files) if migration_files else set()
+    copies = comments = prose = lockfile = 0
+    for path in set(added) | set(deleted):
+        adds, dels = added.get(path, []), deleted.get(path, [])
+        if PROSE_RE.search(path):
+            prose += len(adds) + len(dels)
+            continue
+        if _matches(path, LOCKFILE_PATTERNS):
+            lockfile += len(adds) + len(dels)
+            continue
+        add_mask = _comment_mask(path, adds, RUN_STARTS.get(("+", path)))
+        for line, is_comment in zip(adds, add_mask):
+            if path in migration_files and line.strip() and line.strip() in corpus:
+                copies += 1
+            elif is_comment:
+                comments += 1
+        comments += sum(_comment_mask(path, dels, RUN_STARTS.get(("-", path))))
+    effective = max(0, raw_loc - copies - comments - prose - lockfile)
+    return {
+        "raw": raw_loc,
+        "migration_copies": copies,
+        "comments_blank": comments,
+        "prose": prose,
+        "lockfile": lockfile,
+        "effective": effective,
+    }
+
+
+def effective_loc(
+    added: dict[str, list[str]], raw_loc: int, deleted: dict[str, list[str]] | None = None
+) -> int:
+    """The LOC the tier is judged on — see loc_breakdown."""
+    return loc_breakdown(added, raw_loc, deleted)["effective"]
 
 
 def all_files_skippable(files: list[str]) -> bool:
-    """True iff every changed file matches a skip pattern (config/docs only)."""
+    """True iff every changed file is config/docs — and none is a light-floor
+    file, which a skip pattern can also match (`Taskfile.yml` is .yml,
+    `package.json` is .json) but runs or instructs."""
     if not files:
         return True
-    return all(any(re.search(p, f) for p in SKIP_PATTERNS) for f in files)
+    return all(_matches(f, SKIP_PATTERNS) and not _matches(f, LIGHT_FLOOR_PATTERNS) for f in files)
+
+
+def only_capped_and_skippable(files: list[str]) -> bool:
+    """True iff every file is build tooling, a lockfile, or plain config/docs,
+    and at least one is build tooling or a lockfile. A floor file alongside
+    (workflow, package.json, rules .md) lifts the cap: it is judged on LOC."""
+    is_cap = [_matches(f, CAP_PATTERNS) for f in files]
+    return any(is_cap) and all(c or all_files_skippable([f]) for f, c in zip(files, is_cap))
+
+
+def ci_workflow_hits(
+    files: list[str], added: dict[str, list[str]], deleted: dict[str, list[str]]
+) -> list[str]:
+    """Return ["ci-workflow"] if a workflow file changes a line — added or
+    deleted — touching `permissions:` or a `${{ secrets.* }}` expression."""
+    for f in files:
+        if not _matches(f, CI_WORKFLOW_PATTERNS):
+            continue
+        if any(CI_ESCALATE_RE.search(ln) for ln in added.get(f, []) + deleted.get(f, [])):
+            return ["ci-workflow"]
+    return []
 
 
 def matched_sensitive_paths(files: list[str]) -> list[str]:
@@ -194,6 +577,20 @@ def matched_sensitive_paths(files: list[str]) -> list[str]:
     return sorted(hits)
 
 
+def credential_content_hits(
+    files: list[str], added: dict[str, list[str]], deleted: dict[str, list[str]]
+) -> list[str]:
+    """Return ["credential-content"] if a content-guarded exempt file changes a
+    line touching credential plumbing — added or deleted, since removing a
+    credential-handling call is the regression this exists to catch."""
+    for f in files:
+        if not any(p.search(f) for p in CONTENT_GUARDED_EXEMPT_PATHS):
+            continue
+        if any(CREDENTIAL_CONTENT_RE.search(ln) for ln in added.get(f, []) + deleted.get(f, [])):
+            return ["credential-content"]
+    return []
+
+
 def find_forbidden_markers(added: dict[str, list[str]]) -> list[str]:
     """Return list of 'MARKER in file: <line snippet>' for any forbidden marker hit.
 
@@ -202,24 +599,45 @@ def find_forbidden_markers(added: dict[str, list[str]]) -> list[str]:
     markers apply to code, not documentation about code.
 
     Also skips MARKER_SCAN_EXEMPT files — the scanner's own source and its
-    test file, which legitimately contain marker strings as data.
+    test files, which legitimately contain marker strings as data.
     """
     hits: list[str] = []
     for file, lines in added.items():
-        if any(re.search(p, file) for p in SKIP_PATTERNS):
-            continue  # docs/config — skip marker scan
-        if any(re.search(p, file) for p in MARKER_SCAN_EXEMPT):
+        if _matches(file, LOCKFILE_PATTERNS):
+            continue  # machine-written; a dependency named "todo" is not a marker
+        if not _matches(file, BUILD_PATTERNS) and _matches(file, SKIP_PATTERNS):
+            continue  # docs/config — skip marker scan (build files, e.g. Taskfile.yml, stay in)
+        if _matches(file, MARKER_SCAN_EXEMPT):
             continue  # scanner's own source/tests — marker strings are data
         for line in lines:
             for marker in FORBIDDEN_MARKERS:
-                if re.search(rf"\b{marker}\b", line):
+                # A marker is a note-to-self, and in practice is always written
+                # as `# TODO` / `// TODO` / `TODO:`. A BARE occurrence of the
+                # word is something else entirely: an identifier, a constant, or
+                # drawn UI text. `TEMP` can be a display label and `FIX` is a
+                # substring of ordinary English, so `\bTEMP\b` once blocked a
+                # legitimate test assertion on `("CPU", "41%", "TEMP", "57C", ...)`.
+                #
+                # Requiring the comment prefix or the trailing colon keeps every
+                # real marker -- none of them are written bare -- and drops the
+                # whole false-positive class.
+                if re.search(rf"(#\s*|//\s*){marker}\b|\b{marker}:", line):
                     hits.append(f"{marker} in {file}: {line.strip()[:80]}")
                     break  # one finding per line
     return hits
 
 
-def recommend_tier(files: list[str], added: dict[str, list[str]], loc: int) -> dict:
-    """Decide tier given the diff. Marker block > Skip > sensitive Full > LOC threshold.
+def recommend_tier(
+    files: list[str],
+    added: dict[str, list[str]],
+    loc: int,
+    deleted: dict[str, list[str]] | None = None,
+) -> dict:
+    """Decide tier. Marker BLOCK > sensitive (incl. CI workflow permissions/
+    secrets) Full > docs/config Skip > build-tooling Light (a cap) >
+    zero-effective-LOC Light-if-floor-else-Skip > LOC threshold.
+
+    Sensitivity is judged on non-prose paths only (see PROSE_RE).
 
     Return schema is stable across all tiers — `markers` and `sensitive_patterns`
     are always present (possibly empty lists), so JSON consumers can rely on a
@@ -240,6 +658,19 @@ def recommend_tier(files: list[str], added: dict[str, list[str]], loc: int) -> d
             "markers": markers[:10],
         }
 
+    # Before the config/docs Skip, so config/secrets.yaml cannot Skip; over
+    # non-prose paths, so docs/security.md never escalates.
+    sensitive = matched_sensitive_paths([f for f in files if not PROSE_RE.search(f)])
+    sensitive += credential_content_hits(files, added, deleted or {})
+    sensitive += ci_workflow_hits(files, added, deleted or {})
+    if sensitive:
+        return {
+            **base,
+            "tier": "Full",
+            "reason": f"Sensitive paths or content detected ({', '.join(sensitive)}) — auto-escalate",
+            "sensitive_patterns": sensitive,
+        }
+
     if all_files_skippable(files):
         return {
             **base,
@@ -247,13 +678,25 @@ def recommend_tier(files: list[str], added: dict[str, list[str]], loc: int) -> d
             "reason": "All changed files match config/docs patterns — no testable code",
         }
 
-    sensitive = matched_sensitive_paths(files)
-    if sensitive:
+    if only_capped_and_skippable(files):
         return {
             **base,
-            "tier": "Full",
-            "reason": f"Sensitive paths detected ({', '.join(sensitive)}) — auto-escalate",
-            "sensitive_patterns": sensitive,
+            "tier": "Light",
+            "reason": "Only build tooling or lockfiles (plus docs/config) changed — capped at Light",
+        }
+
+    if loc == 0 and any(_matches(f, LIGHT_FLOOR_PATTERNS) for f in files):
+        return {
+            **base,
+            "tier": "Light",
+            "reason": "No effective LOC, but executable config or instruction files changed — never Skip",
+        }
+
+    if loc == 0:
+        return {
+            **base,
+            "tier": "Skip",
+            "reason": "Only comments, blank lines, prose or copied migration lines changed",
         }
 
     if loc < LIGHT_THRESHOLD:
@@ -275,7 +718,21 @@ def print_human(result: dict) -> None:
     icon = icons.get(result["tier"], "❓")
     print(f"{icon}  Tier: {result['tier']}")
     print(f"   {result['reason']}")
-    print(f"   Files: {result['files']}, LOC: {result['loc']}")
+    loc_line = f"   Files: {result['files']}, LOC: {result['loc']}"
+    b = result.get("loc_breakdown")
+    if b and b["raw"] != b["effective"]:
+        parts = [
+            f"{b[k]} {label}"
+            for k, label in (
+                ("comments_blank", "comment/blank"),
+                ("prose", "prose"),
+                ("lockfile", "lockfile"),
+                ("migration_copies", "copied from a sibling migration"),
+            )
+            if b.get(k)
+        ]
+        loc_line += f" ({b['raw']} raw; not counted: {', '.join(parts)})"
+    print(loc_line)
     if result.get("markers"):
         print("   Markers:")
         for m in result["markers"]:
@@ -289,8 +746,11 @@ def main() -> None:
     json_mode = "--json" in sys.argv
     scope = args[0] if args else "HEAD"
 
-    files, added, loc = get_diff(scope)
-    result = recommend_tier(files, added, loc)
+    files, added, raw_loc, deleted = get_diff(scope)
+    breakdown = loc_breakdown(added, raw_loc, deleted)
+    result = recommend_tier(files, added, breakdown["effective"], deleted)
+    result["raw_loc"] = raw_loc
+    result["loc_breakdown"] = breakdown
 
     if json_mode:
         print(json.dumps(result, indent=2))
