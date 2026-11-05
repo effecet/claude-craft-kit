@@ -182,6 +182,7 @@ def test_main_wiring_alert_groups_never_degrade_and_rank_order_is_cheapest_first
         "config",
         "dedup",
         "brain",
+        "orphans",
         "hook_drift",
     ]
     groups = ss.build_groups(**{name: [name] for name in names})
@@ -191,6 +192,7 @@ def test_main_wiring_alert_groups_never_degrade_and_rank_order_is_cheapest_first
     assert {g.name for g in groups if g.rank is None} == {
         "config",
         "brain",
+        "orphans",
         "hook_drift",
     }
     degradable = sorted((g for g in groups if g.rank is not None), key=lambda g: g.rank)
@@ -206,3 +208,28 @@ def test_meter_mentions_clipping_even_when_a_group_was_dropped_too(tmp_path):
         groups, resumed=False, overflow_file=tmp_path / "f.txt"
     ).splitlines()[-1]
     assert "lines clipped" in meter and "dropped: evolve" in meter
+
+
+def test_main_passes_orphan_drift_output_as_the_orphans_group(monkeypatch, tmp_path):
+    """build_groups is pinned above; this pins that main() feeds it the right
+    variable, so a wrong-name slip in main() goes red."""
+    monkeypatch.setattr(ss, "init_state", lambda: (ss.make_fresh_state(), False))
+    monkeypatch.setattr(ss, "write_state", lambda state: None)
+    monkeypatch.setattr(ss, "build_brief", lambda state, resumed: "brief")
+    monkeypatch.setattr(ss, "BRIEF_FILE", tmp_path / "brief.md")
+    for name in (
+        "brain_sync", "memory_decay", "evolve_check",
+    ):
+        monkeypatch.setattr(ss, name, lambda state, _n=name: [_n])
+    for name in (
+        "config_sync_check", "live_hooks_branch", "config_untracked",
+        "secret_scan_status", "canary_liveness", "dedup_warning",
+        "brain_check", "orphan_drift", "hook_drift",
+    ):
+        monkeypatch.setattr(ss, name, lambda _n=name: [_n])
+    captured = {}
+    monkeypatch.setattr(ss, "render_stdout", lambda groups, *a: captured.setdefault("g", groups) and "")
+    ss.main()
+    by_name = {g.name: g.lines for g in captured["g"]}
+    assert by_name["orphans"] == ["orphan_drift"]
+    assert by_name["brain"] == ["brain_check"]

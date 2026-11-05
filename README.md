@@ -81,8 +81,10 @@ Postgres-backed memory store; a reference implementation is
 **Pending work queue** — `session_start.py` surfaces deferred work in the session
 brief: the top open items, priority-ordered. It reads a plain `pending.md` by
 default, and with `BRAIN_ENABLED=true` reads the backend's `pending` table instead
-(written via memory-persistor's `pending_add` / `pending_resolve` tools). Both paths
-fail open — a missing file or unreachable database never blocks session start.
+(written via memory-persistor's `pending_add` / `pending_resolve` tools). From the
+database it shows this machine's items plus fleet-wide ones, and counts the items
+scoped to other hosts. Both paths fail open — a missing file or unreachable database
+never blocks session start.
 
 ## Quick start
 

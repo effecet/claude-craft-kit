@@ -31,8 +31,8 @@ sequenceDiagram
 
 ### 1. SessionStart — `session_start.py`
 Initializes or resumes session state (`~/.claude/session/state.json`), prints git
-context, and surfaces open specs. Optional brain steps (sync, decay) run only when
-`BRAIN_ENABLED=true`.
+context, and surfaces open specs. Optional brain steps (sync, decay, host-scoped
+pending, orphan-memory drift) run only when `BRAIN_ENABLED=true`.
 
 ### 2. Per message — `track.py`, `consume_prompt.py`
 Counts user messages, reports token usage, detects friction and "goodbye" phrases
@@ -90,5 +90,8 @@ enable:
    server with thermal decay and a knowledge graph.
 3. `proactive_recall.py` then surfaces relevant memories on each prompt; `backup_hook.py`
    does a generic `git` backup of your config dir to a remote you configure.
+4. With the backend checked out at `MEMORY_REPO_DIR`, `session_start.py` also reports
+   orphan memory files (a `pg_id` with no live entity, or no `pg_id` at all) using the
+   backend's `scripts/memory_dedup.py`. Silent when there are none.
 
 Until you do that, everything runs standalone — no DB, no network.

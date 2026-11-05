@@ -28,6 +28,12 @@ export BRAIN_ENABLED="false"
 # If BRAIN_ENABLED=true, point recall at your Postgres-backed memory store:
 # export DATABASE_URL="postgresql://postgres.<project-ref>:<password>@aws-0-<region>.pooler.supabase.com:6543/postgres"
 
+# Local checkout of the backend repo (default: ~/Desktop or ~/Downloads/memory-backend).
+# session_start uses its Makefile for the connectivity check and imports its
+# scripts/memory_dedup.py for the orphan-memory drift line — so that checkout's
+# code runs at every session start. Point this only at a checkout you trust.
+# export MEMORY_REPO_DIR="$HOME/src/memory-persistor"
+
 # The name of your memory MCP tool used in the memory rules (rules/memory.md).
 export MEMORY_REMEMBER_TOOL="mcp__memory__remember"
 

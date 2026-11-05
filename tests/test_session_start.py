@@ -6,8 +6,10 @@ which is the part that must never hard-fail a session start.
 
 from __future__ import annotations
 
-import session_start as ss
+import re
+
 import pytest
+import session_start as ss
 
 
 class _FakeCompleted:
@@ -20,35 +22,39 @@ class _FakeCompleted:
 # ── DB tier (BRAIN_ENABLED=true) ─────────────────────────────────────────────
 
 
+@pytest.fixture
+def db_tier(monkeypatch, tmp_path) -> None:
+    """Exercise the DB tier only.
+
+    BRAIN_ENABLED is read at import time, so patch the module attribute.
+    PENDING_FILE points at a path that provably doesn't exist, so a
+    regression that short-circuits the DB tier can't silently fall through
+    to reading the real pending.md on whoever's machine runs the suite.
+    shutil.which is stubbed so these tests do not depend on psql being
+    installed on the machine (or the CI image) running them.
+    """
+    monkeypatch.setattr(ss, "BRAIN_ENABLED", True)
+    monkeypatch.setattr(ss, "PENDING_FILE", tmp_path / "unreachable.md")
+    monkeypatch.setattr(ss.shutil, "which", lambda _: "/usr/bin/psql")
+
+
+@pytest.mark.usefixtures("db_tier")
 class TestPendingSectionFromDb:
-    @pytest.fixture(autouse=True)
-    def _db_tier(self, monkeypatch, tmp_path) -> None:
-        """Exercise the DB tier only.
-
-        BRAIN_ENABLED is read at import time, so patch the module attribute.
-        PENDING_FILE points at a path that provably doesn't exist, so a
-        regression that short-circuits the DB tier can't silently fall through
-        to reading the real pending.md on whoever's machine runs the suite.
-        shutil.which is stubbed so these tests do not depend on psql being
-        installed on the machine (or the CI image) running them.
-        """
-        monkeypatch.setattr(ss, "BRAIN_ENABLED", True)
-        monkeypatch.setattr(ss, "PENDING_FILE", tmp_path / "unreachable.md")
-        monkeypatch.setattr(ss.shutil, "which", lambda _: "/usr/bin/psql")
-
     def test_renders_titles_with_priority_prefix(self, monkeypatch) -> None:
-        rows = "3\thigh\tFix the thing\n3\tlow\tDo the other\n"
+        # Row 1 is the counts row (open here, scoped to other hosts); the rest
+        # are `priority<TAB>title` items.
+        rows = "3\t0\nhigh\tFix the thing\nlow\tDo the other\n"
         monkeypatch.setattr(ss, "resolve_connection_string", lambda *a: "postgresql://x")
         monkeypatch.setattr(
             ss.subprocess, "run", lambda *a, **k: _FakeCompleted(0, rows)
         )
         out = ss.pending_section()
-        assert "## Pending (3 open, showing 2)" in out
+        assert "## Pending (3 open here, showing 2)\n" in out
         assert "- [high] Fix the thing" in out
         assert "- [low] Do the other" in out
 
     def test_omits_bodies_entirely(self, monkeypatch) -> None:
-        rows = "1\thigh\tShort title\n"
+        rows = "1\t0\nhigh\tShort title\n"
         monkeypatch.setattr(ss, "resolve_connection_string", lambda *a: "postgresql://x")
         monkeypatch.setattr(
             ss.subprocess, "run", lambda *a, **k: _FakeCompleted(0, rows)
@@ -66,6 +72,7 @@ class TestPendingSectionFromDb:
         captured = {}
 
         def fake_run(args, **kwargs):
+            captured["args"] = args
             captured["sql"] = args[-1]
             captured["timeout"] = kwargs.get("timeout")
             return _FakeCompleted(0, "")
@@ -80,30 +87,225 @@ class TestPendingSectionFromDb:
         # Escapes must reach Postgres literally, not as real tab/newline bytes.
         assert r"E'\t'" in captured["sql"]
         assert captured["timeout"] == ss.PENDING_TIMEOUT_S
+        # psql reports only the LAST -c statement's status, so without
+        # ON_ERROR_STOP a failing counts query would exit 0 and the renderer
+        # would eat the first item as the counts row.
+        assert "ON_ERROR_STOP=1" in captured["args"]
+        assert captured["args"].count("-c") == 2
+        # ~/.psqlrc could otherwise add lines to stdout ahead of the counts row.
+        assert "-X" in captured["args"]
+        # Every separator the renderer splits on is replaced in titles.
+        assert r"E'\r'" in captured["sql"]
+
+    def test_a_carriage_return_in_a_title_does_not_truncate_it(
+        self, monkeypatch
+    ) -> None:
+        # Rows are split on \n only: splitlines() would also break on \r and
+        # cut the title short.
+        rows = "1\t0\nhigh\tA\rB rest\n"
+        monkeypatch.setattr(ss, "resolve_connection_string", lambda *a: "postgresql://x")
+        monkeypatch.setattr(
+            ss.subprocess, "run", lambda *a, **k: _FakeCompleted(0, rows)
+        )
+        assert "- [high] A\rB rest" in ss.pending_section()
 
     def test_a_title_containing_a_tab_does_not_shift_columns(self, monkeypatch) -> None:
         # A residual tab in the last field folds into the title, because the
-        # split is bounded at maxsplit=2.
-        rows = "1\thigh\ttitle\twith tab\n"
+        # item split is bounded at maxsplit=1.
+        rows = "1\t0\nhigh\ttitle\twith tab\n"
         monkeypatch.setattr(ss, "resolve_connection_string", lambda *a: "postgresql://x")
         monkeypatch.setattr(
             ss.subprocess, "run", lambda *a, **k: _FakeCompleted(0, rows)
         )
         out = ss.pending_section()
-        assert "## Pending (1 open, showing 1)" in out
-        assert "- [high] title" in out
+        assert "## Pending (1 open here, showing 1)" in out
+        assert "- [high] title\twith tab" in out
+
+
+# ── host scoping ─────────────────────────────────────────────────────────────
+
+
+@pytest.mark.usefixtures("db_tier")
+class TestPendingHostScope:
+    @pytest.fixture(autouse=True)
+    def _conn(self, monkeypatch) -> None:
+        monkeypatch.setattr(ss, "resolve_connection_string", lambda *a: "postgresql://x")
+
+    def _render(self, monkeypatch, stdout: str) -> str:
+        monkeypatch.setattr(
+            ss.subprocess, "run", lambda *a, **k: _FakeCompleted(0, stdout)
+        )
+        return ss.pending_section()
+
+    # The reference table for the host rule (lowercase, cut at the first dot,
+    # keep only [a-z0-9_-]), copied verbatim from the backend's parity test.
+    # The backend's normalizeHost is pinned to the same table; if the two ever
+    # disagree, an item stops matching its own machine and silently vanishes.
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            ("Laptop-A", "laptop-a"),
+            ("Laptop-A.local", "laptop-a"),
+            ("server-b", "server-b"),
+            ("SERVER-B", "server-b"),
+            ("server-b.lan", "server-b"),
+            ("host.with.many.dots", "host"),
+            ("ALLCAPS", "allcaps"),
+            ("already-lower", "already-lower"),
+            ("", ""),
+            ("LAPTOP A", "laptopa"),
+            ("Jane's MacBook Pro", "janesmacbookpro"),
+            ("host_with_underscores", "host_with_underscores"),
+            ("weird!@#chars", "weirdchars"),
+            ("...", ""),
+        ],
+    )
+    def test_normalize_host_follows_the_shared_rule(self, raw, expected) -> None:
+        assert ss.normalize_host(raw) == expected
+        # Idempotent, as the backend's rule is: a stored host re-normalises
+        # to itself.
+        assert ss.normalize_host(expected) == expected
+
+    @pytest.mark.parametrize(
+        "raw", ["a'; DROP TABLE pending; --", 'x" OR 1=1', "back\\slash"]
+    )
+    def test_normalize_host_output_cannot_break_a_sql_literal(self, raw) -> None:
+        out = ss.normalize_host(raw)
+        assert re.fullmatch(r"[a-z0-9_-]*", out)
+
+    def test_the_query_embeds_only_the_normalized_host(self, monkeypatch) -> None:
+        monkeypatch.setattr(ss, "MACHINE_ID", "Evil'; DROP")
+        sql = ss._counts_sql() + ss._items_sql()
+        assert "'evildrop' = ANY(applies_to)" in sql
+        assert "DROP." not in sql
+        assert "cardinality(applies_to) = 0" in sql
+
+    def test_scope_checks_are_null_safe(self) -> None:
+        # A NULL element makes `= ANY(...)` NULL; a bare predicate would drop
+        # such a row from BOTH counts.
+        sql = ss._counts_sql()
+        assert ") IS TRUE)" in sql
+        assert ") IS NOT TRUE)" in sql
+        assert ") IS TRUE" in ss._items_sql()
+
+    def test_reports_items_scoped_to_other_hosts(self, monkeypatch) -> None:
+        out = self._render(monkeypatch, "2\t3\nhigh\tHere item\n")
+        assert out.startswith(
+            "## Pending (2 open here, showing 1 · 3 scoped to other hosts)\n"
+        )
+
+    def test_hidden_count_survives_an_empty_local_queue(self, monkeypatch) -> None:
+        # The case the count exists for: nothing here, items elsewhere. A
+        # window function would return zero rows and hide the whole queue.
+        out = self._render(monkeypatch, "0\t4\n")
+        assert out == (
+            "## Pending (0 open here · 4 scoped to other hosts)\nNone for this machine.\n"
+        )
+
+    def test_zero_hidden_adds_no_scope_note(self, monkeypatch) -> None:
+        out = self._render(monkeypatch, "0\t0\n")
+        assert out == "## Pending (0 open here)\nNone for this machine.\n"
+
+    def test_a_malformed_counts_row_keeps_every_item(
+        self, monkeypatch, capsys
+    ) -> None:
+        # If the counts row is not two integers, it is an item: dropping it
+        # would lose the highest-priority line.
+        out = self._render(monkeypatch, "high\tTop item\nlow\tOther\n")
+        assert "## Pending (showing 2)" in out
+        assert "- [high] Top item" in out
+        assert "- [low] Other" in out
+        assert "unparseable counts row" in capsys.readouterr().err
+
+    def test_a_database_without_applies_to_uses_the_unscoped_query(
+        self, monkeypatch, capsys
+    ) -> None:
+        calls = []
+
+        def fake_run(args, **kwargs):
+            calls.append(args)
+            if len(calls) == 1:
+                return _FakeCompleted(
+                    1, "", 'ERROR:  42703: column "applies_to" does not exist'
+                )
+            return _FakeCompleted(0, "2\thigh\tOld schema item\n")
+
+        monkeypatch.setattr(ss.subprocess, "run", fake_run)
+        out = ss.pending_section()
+        assert len(calls) == 2
+        assert "applies_to" not in calls[1][-1]
+        assert "## Pending (2 open, showing 1)" in out
+        assert "- [high] Old schema item" in out
+        assert "no applies_to column" in capsys.readouterr().err
+
+    def test_a_failed_legacy_query_falls_back_to_the_file_tier(
+        self, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(
+            ss.subprocess,
+            "run",
+            lambda *a, **k: _FakeCompleted(
+                1, "", 'ERROR:  42703: column "applies_to" does not exist'
+            ),
+        )
+        assert ss.pending_section().strip() == "## Pending\nNone."
+
+    @pytest.mark.parametrize(
+        "stderr",
+        [
+            'ERROR:  42703: column "applies_to" does not exist',
+            'ERROR:  column "applies_to" does not exist',
+        ],
+    )
+    def test_both_psql_error_forms_trigger_the_fallback(self, monkeypatch, stderr) -> None:
+        calls = []
+
+        def fake_run(args, **kwargs):
+            calls.append(args)
+            return _FakeCompleted(1, "", stderr) if len(calls) == 1 else _FakeCompleted(0, "")
+
+        monkeypatch.setattr(ss.subprocess, "run", fake_run)
+        # An empty legacy result renders as "None.", from the legacy renderer.
+        assert ss.pending_section() == "## Pending\nNone.\n"
+        assert len(calls) == 2
+        assert "applies_to" not in calls[1][-1]
+
+    def test_a_non_schema_error_naming_the_column_does_not_retry(
+        self, monkeypatch
+    ) -> None:
+        # e.g. a permission error mentioning applies_to: not SQLSTATE 42703.
+        calls = []
+
+        def fake_run(args, **kwargs):
+            calls.append(args)
+            return _FakeCompleted(
+                1, "", "ERROR:  42501: permission denied for column applies_to"
+            )
+
+        monkeypatch.setattr(ss.subprocess, "run", fake_run)
+        assert ss.pending_section().strip() == "## Pending\nNone."
+        assert len(calls) == 1
+
+    def test_other_query_errors_do_not_retry(self, monkeypatch) -> None:
+        calls = []
+
+        def fake_run(args, **kwargs):
+            calls.append(args)
+            return _FakeCompleted(1, "", "connection refused")
+
+        monkeypatch.setattr(ss.subprocess, "run", fake_run)
+        assert ss.pending_section().strip() == "## Pending\nNone."
+        assert len(calls) == 1
 
 
 # ── fail-open ────────────────────────────────────────────────────────────────
 
 
+@pytest.mark.usefixtures("db_tier")
 class TestPendingSectionFailsOpen:
     @pytest.fixture(autouse=True)
-    def _db_tier(self, monkeypatch, tmp_path) -> None:
-        monkeypatch.setattr(ss, "BRAIN_ENABLED", True)
-        monkeypatch.setattr(ss, "PENDING_FILE", tmp_path / "nope.md")
+    def _conn(self, monkeypatch) -> None:
         monkeypatch.setattr(ss, "resolve_connection_string", lambda *a: "postgresql://u:p@h/db")
-        monkeypatch.setattr(ss.shutil, "which", lambda _: "/usr/bin/psql")
 
     def test_a_raising_query_never_propagates(self, monkeypatch, capsys) -> None:
         def boom(*a, **k):

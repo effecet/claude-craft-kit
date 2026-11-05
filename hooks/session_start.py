@@ -9,6 +9,7 @@ Responsibilities:
   3. Write brief.md for Claude to read and present as orientation
 """
 
+import inspect
 import json
 import math
 import os
@@ -19,6 +20,7 @@ import subprocess
 import sys
 import time
 import urllib.parse
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -80,25 +82,92 @@ def _config_dir(root: Path) -> Path:
     """The directory holding hooks/ and scripts/ inside a config checkout."""
     return root / CONFIG_SUBDIR if CONFIG_SUBDIR else root
 
-# rf-string (not f-string): PENDING_BRIEF_LIMIT still interpolates, but the
-# E'\t' / E'\n' escapes below must reach Postgres as the literal two-char
-# sequences — a plain f-string would have Python collapse them into real
-# tab/newline bytes before the query text is even built.
+
+def normalize_host(host: str) -> str:
+    """Canonical host spelling: lowercase, cut at the first dot, keep [a-z0-9_-].
+
+    Pending items can be scoped to hosts (the backend's `applies_to` column),
+    which makes visibility a string comparison between the host the backend
+    STORED and the host computed here. This MUST match the backend's
+    `normalizeHost` exactly; if the two ever disagree, an item stops matching
+    its own machine and silently disappears. The character strip is part of
+    the rule, not sanitation for one call site.
+
+    Only this side can be pinned here (tests/test_session_start.py carries the
+    backend's reference table); the backend pins its own side against the same
+    table, so the two meet at the table rather than in one test.
+    """
+    return re.sub(r"[^a-z0-9_-]", "", host.split(".")[0].lower())
+
+
+def _host_scope() -> str:
+    """SQL predicate: fleet-wide (empty applies_to) or scoped to this host.
+
+    The host is embedded directly because psql does not interpolate `-v`
+    variables into `-c` statements. That is safe only because normalize_host
+    is an allowlist — no quote, backslash or semicolon survives it.
+
+    Built from MACHINE_ID, which is resolved once at import, so calling this
+    for each statement costs only the normalisation.
+    """
+    host = normalize_host(MACHINE_ID)
+    return f"(cardinality(applies_to) = 0 OR '{host}' = ANY(applies_to))"
+
+
+# The counts are their own statement, not a window function over the items,
+# because the hidden count must survive ZERO items in scope here — exactly when
+# it matters. `IS TRUE` / `IS NOT TRUE` keep the partition total: a NULL element
+# in applies_to makes `= ANY(...)` NULL, and a bare predicate would drop that
+# row from both counts.
+def _counts_sql() -> str:
+    scope = _host_scope()
+    return f"""
+SELECT COUNT(*) FILTER (WHERE ({scope}) IS TRUE) AS here_open,
+       COUNT(*) FILTER (WHERE ({scope}) IS NOT TRUE) AS hidden_by_host
+FROM pending
+WHERE status = 'open';
+"""
+
+
+# Shared by the scoped and legacy item queries so the two cannot drift.
 #
-# category is deliberately NOT selected: pending_section() only ever renders
-# priority + title (see the `- [{priority}] {title}` line below), so a
-# category column would be dead weight in every row shipped over the wire.
-# If a future brief wants to show category, add it back here AND widen the
-# split/index logic below in lockstep — they must agree on column count.
-PENDING_SQL = rf"""
-SELECT COUNT(*) OVER () AS total_open,
-       priority,
-       replace(replace(title, E'\t', ' '), E'\n', ' ') AS title
+# Raw strings: the E'\t' / E'\n' / E'\r' escapes must reach Postgres as the
+# literal two-char sequences, not as real control bytes. Every row separator
+# the renderers split on is replaced, so a title can never spill into a second
+# row or shift a column.
+_TITLE_COL = (
+    r"replace(replace(replace(title, E'\t', ' '), E'\n', ' '), E'\r', ' ') AS title"
+)
+_ORDER_LIMIT = f"""ORDER BY CASE priority WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END,
+         created_at DESC
+LIMIT {PENDING_BRIEF_LIMIT};"""
+
+# category is deliberately NOT selected: the brief only ever renders
+# priority + title, so a category column would be dead weight on the wire.
+# Adding a column means widening the matching renderer in lockstep:
+# _items_sql -> _render_pending (2 columns, after its counts row), and
+# PENDING_LEGACY_SQL -> _render_pending_legacy (3 columns).
+
+
+def _items_sql() -> str:
+    return f"""
+SELECT priority, {_TITLE_COL}
+FROM pending
+WHERE status = 'open' AND ({_host_scope()}) IS TRUE
+{_ORDER_LIMIT}
+"""
+
+
+# DELETE once every supported backend carries applies_to: this constant,
+# _render_pending_legacy, the _is_missing_applies_to retry in
+# _pending_from_db, and their tests. A degrade path with no expiry becomes
+# permanent scaffolding. It exists because code can reach a machine before the
+# matching backend migration does.
+PENDING_LEGACY_SQL = f"""
+SELECT COUNT(*) OVER () AS total_open, priority, {_TITLE_COL}
 FROM pending
 WHERE status = 'open'
-ORDER BY CASE priority WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END,
-         created_at DESC
-LIMIT {PENDING_BRIEF_LIMIT};
+{_ORDER_LIMIT}
 """
 
 # When false (default), all calls into an optional private "memory brain"
@@ -629,6 +698,201 @@ def stale_project_memories() -> list[str]:
     return [f"{name} — {days}d old" for name, days in stale[:10]]
 
 
+# ── Orphan memory drift (optional memory backend) ────────────────────────────
+
+ThermalFetch = Callable[..., dict[str, tuple[str, float]] | None]
+
+ORPHAN_TIMEOUT_S = 5  # matches PENDING_TIMEOUT_S — session start must not stall
+
+# At or below this many ids, a 100%-unresolved result is unremarkable (a small
+# or new project dir). Above it, "every single id is dead" far more likely means
+# the wrong database than genuine total drift.
+MIN_IDS_FOR_DRIFT_ALARM = 5
+
+# A pg_id must be a real uuid before it goes to the backend. memory_dedup's own
+# filter is looser, and one id that passes it but fails Postgres's ::uuid cast
+# fails the whole batch — silencing the dead count for every dir.
+_UUID_RE = re.compile(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+)
+
+
+def _load_memory_dedup():
+    """Import the backend's scripts/memory_dedup.py, or None if unavailable.
+
+    Reused rather than re-implemented: the frontmatter reader and the batched
+    `pg_id -> (tier, temperature)` lookup are one contract with the backend's
+    own index emitter, and a copy here would drift from it.
+
+    Importing is safe because memory_dedup keeps every mutation behind its
+    `__name__`-guarded main(). Module level is not fully inert — it evaluates
+    `APPLY = "--apply" in sys.argv` — so the invariant to preserve is
+    "mutations are main()-only", not "importing does nothing". The import runs
+    the checkout's code at every session start, which is why it is behind
+    BRAIN_ENABLED.
+
+    This hook appends scripts/ to sys.path rather than prepending it, so the
+    lookup for memory_dedup itself cannot outrank the stdlib. That is not a
+    full shadowing guarantee: memory_dedup prepends its own directory when it
+    is imported.
+    """
+    scripts_dir = MEMORY_REPO_DIR / "scripts"
+    if not (scripts_dir / "memory_dedup.py").is_file():
+        return None
+    try:
+        if str(scripts_dir) not in sys.path:
+            sys.path.append(str(scripts_dir))
+        import memory_dedup
+
+        return memory_dedup
+    except Exception as exc:
+        print(f"[session_start] memory_dedup import failed: {type(exc).__name__}", file=sys.stderr)
+        return None
+
+
+def orphan_drift(
+    projects_root: Path | None = None, fetch: ThermalFetch | None = None
+) -> list[str]:
+    """Report memory files on THIS machine whose pg_id has no live entity.
+
+    Gated behind BRAIN_ENABLED — no-op when the optional brain is disabled.
+
+    Orphans rank at temperature 0 in a Postgres-ranked memory index, so they
+    are first in line for eviction from it, and nothing else reports them.
+    Scans every project dir on the machine in one batched query: the markdown
+    mirror is per-machine state, and drift shows up in dirs you are not in.
+
+    An orphan includes a file with NO pg_id at all (memory_dedup's definition).
+    Three causes are counted apart: a dead pointer needs triage, an invalid
+    (non-uuid) pg_id needs repair, a missing id needs a backfill. Emits nothing
+    at zero. When the DB is unreachable, or no connection string resolves,
+    only the `dead` count is suppressed; `invalid` and `missing` are filesystem
+    state and stay reportable, because a false "0 orphans" would be worse.
+    The wrong-datasource alarm likewise suppresses only `dead`: it is followed
+    by a drift line for any invalid or missing ids.
+    """
+    if not BRAIN_ENABLED:
+        return []
+    try:
+        root = Path(projects_root) if projects_root else CLAUDE_DIR / "projects"
+        md = _load_memory_dedup()
+        fetch = fetch or (getattr(md, "fetch_thermal_by_pgid", None) if md else None)
+        if md is None or fetch is None or not root.is_dir():
+            return []
+
+        files = list(_iter_memory_pgids(root, md.read_fm))
+        missing: list[str] = []
+        invalid: list[str] = []
+        with_ids: list[tuple[str, str]] = []
+        for pgid, d in files:
+            if not pgid:
+                missing.append(d)
+            elif _UUID_RE.fullmatch(pgid):
+                with_ids.append((pgid, d))
+            else:
+                invalid.append(d)
+
+        resolved = _fetch_resolved(fetch, [pgid for pgid, _ in with_ids])
+        # None = UNKNOWN (DB unreachable, or no connection string).
+        dead = [d for pgid, d in with_ids if pgid not in resolved] if resolved is not None else []
+
+        # A machine pointed at the wrong database answers successfully with {},
+        # so every live id reads as dead. Say that instead of a drift count.
+        # The filesystem causes stay reportable even then.
+        if with_ids and len(dead) == len(with_ids) and len(with_ids) > MIN_IDS_FOR_DRIFT_ALARM:
+            msgs = [
+                f"⚠️ All {len(with_ids)} memory pg_ids unresolved against the backend — "
+                "suspected wrong datasource (check DATABASE_URL / DOTENV_CONFIG_PATH), "
+                "not a drift report."
+            ]
+            dead = []
+        else:
+            msgs = []
+
+        if invalid or missing or dead:
+            dirs = len(set(dead + invalid + missing))
+            msgs.append(
+                _drift_line(dead=len(dead), invalid=len(invalid), missing=len(missing), dirs=dirs)
+            )
+        return msgs
+    except Exception as exc:
+        # Silent in the brief, never silent everywhere.
+        print(f"[session_start] orphan_drift failed: {type(exc).__name__}", file=sys.stderr)
+        return []
+
+
+def _fetch_resolved(
+    fetch: ThermalFetch, ids: list[str]
+) -> dict[str, tuple[str, float]] | None:
+    """Call `fetch`, passing this hook's DB URL and timeout if it accepts them.
+
+    Capability is read from the signature, NOT by calling and catching
+    TypeError: a TypeError from deep inside a correct fetch would otherwise
+    trigger a bare retry against memory_dedup's own resolver, which reads
+    different files and may query a different database.
+
+    For the same reason, the lookup is skipped and the result is UNKNOWN (None),
+    never handed to memory_dedup's resolver, when the fetch's signature cannot
+    be read or when it takes `url` but this hook resolves no connection string.
+    """
+    if not ids:
+        return {}
+    try:
+        params = inspect.signature(fetch).parameters
+    except (TypeError, ValueError):
+        _log_dead_unchecked("fetch signature unreadable")
+        return None
+    accepts_any = any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+    kwargs: dict[str, object] = {}
+    if accepts_any or "timeout" in params:
+        kwargs["timeout"] = ORPHAN_TIMEOUT_S
+    if accepts_any or "url" in params:
+        url = resolve_connection_string(MEMORY_REPO_DIR)
+        if url is None:
+            _log_dead_unchecked("no connection string resolved")
+            return None
+        kwargs["url"] = url
+    return fetch(ids, **kwargs)
+
+
+def _log_dead_unchecked(reason: str) -> None:
+    print(f"[session_start] orphan check: {reason}; dead pg_ids not checked", file=sys.stderr)
+
+
+def _iter_memory_pgids(
+    root: Path, read_fm: Callable[[Path], dict]
+) -> Iterator[tuple[str, str]]:
+    """Yield (pg_id or "", project_dir_name) for every memory file under root.
+
+    MEMORY.md is the index, not a memory, and is never counted. An unreadable
+    file is skipped rather than allowed to break session start.
+    """
+    for f in sorted(root.glob("*/memory/*.md")):
+        if f.name == "MEMORY.md":
+            continue
+        try:
+            yield read_fm(f)["pgid"] or "", f.parent.parent.name
+        except Exception:
+            continue
+
+
+def _drift_line(*, dead: int, invalid: int, missing: int, dirs: int) -> str:
+    """One line naming each non-zero cause. Keyword-only: bare ints are
+    silently transposable otherwise."""
+    parts = []
+    if dead:
+        parts.append(f"{dead} dead pg_id")
+    if invalid:
+        parts.append(f"{invalid} invalid pg_id")
+    if missing:
+        parts.append(f"{missing} without pg_id")
+    return (
+        f"⚠️ Orphan memory files: {', '.join(parts)} across {dirs} dir(s) — "
+        "all rank at temp 0. The backend's `scripts/memory_dedup.py` triages "
+        "the primary dir only."
+    )
+
+
 # ── Open specs ────────────────────────────────────────────────────────────────
 
 
@@ -679,9 +943,50 @@ def _pending_from_file() -> str | None:
     return f"## Pending\n{content}\n" if content else None
 
 
-def _render_pending_rows(stdout: str) -> str:
-    """Format psql's tab-separated rows into the brief's Pending section."""
-    rows = [r for r in stdout.strip().splitlines() if r.strip()]
+def _render_pending(stdout: str) -> str:
+    """Render the host-scoped brief from the two-statement psql output.
+
+    Line 1 is the counts row (`here_open<TAB>hidden_by_host`); the rest are
+    items (`priority<TAB>title`). maxsplit=1 folds any residual tab in a title
+    into the title instead of shifting the priority column.
+    """
+    rows = [r for r in stdout.strip().split("\n") if r.strip()]
+    if not rows:
+        return "## Pending\nNone.\n"
+
+    # Trust the counts row only if it is two integers, and drop it only then:
+    # consuming it unconditionally would lose the first — highest-priority —
+    # item whenever it is not there. Less output beats a confident wrong one.
+    counts = [c.strip() for c in rows[0].split("\t")]
+    here = hidden = None
+    if len(counts) == 2 and all(c.isdigit() for c in counts):
+        here, hidden = counts
+        item_rows = rows[1:]
+    else:
+        item_rows = rows
+        print(
+            f"[session_start] pending: unparseable counts row {rows[0][:80]!r}; "
+            "rendering all rows as items, count omitted",
+            file=sys.stderr,
+        )
+
+    lines = [
+        f"- [{p[0]}] {p[1]}" for p in (r.split("\t", 1) for r in item_rows) if len(p) == 2
+    ]
+
+    # Reported even when it is the only thing to report: an item scoped to a
+    # hostname that does not exist is invisible on every machine, and without
+    # this number that looks exactly like it was resolved.
+    scope_note = f" · {hidden} scoped to other hosts" if hidden not in (None, "0") else ""
+    if not lines:
+        return f"## Pending ({here or 0} open here{scope_note})\nNone for this machine.\n"
+    shown = f"{here} open here, showing {len(lines)}" if here else f"showing {len(lines)}"
+    return f"## Pending ({shown}{scope_note})\n" + "\n".join(lines) + "\n"
+
+
+def _render_pending_legacy(stdout: str) -> str:
+    """Render the unscoped query, for a backend without applies_to."""
+    rows = [r for r in stdout.strip().split("\n") if r.strip()]
     if not rows:
         return "## Pending\nNone.\n"
 
@@ -736,6 +1041,35 @@ def _psql_env(conn: str) -> dict[str, str] | None:
     return env
 
 
+def _run_psql(env: dict[str, str], *statements: str) -> subprocess.CompletedProcess:
+    """Run statements in ONE psql connection, tab-separated, tuples only.
+
+    ON_ERROR_STOP is load-bearing with several -c statements: psql reports only
+    the LAST one's status, so a failing counts query beside a succeeding items
+    query would otherwise exit 0. VERBOSITY=verbose puts the SQLSTATE in stderr.
+    -X skips ~/.psqlrc, whose settings could add lines to stdout.
+    """
+    argv = ["psql", "-X", "-v", "ON_ERROR_STOP=1", "-v", "VERBOSITY=verbose", "-t", "-A", "-F", "\t"]
+    for sql in statements:
+        argv += ["-c", sql]
+    return subprocess.run(
+        argv, capture_output=True, text=True, timeout=PENDING_TIMEOUT_S, env=env
+    )
+
+
+def _is_missing_applies_to(stderr: str | None) -> bool:
+    """True only for undefined_column naming applies_to — a backend that
+    predates host scoping. Recognised by SQLSTATE 42703 (VERBOSITY=verbose) or
+    by Postgres's own `column "applies_to" does not exist` wording, so it holds
+    whichever form psql prints. Any other error naming the column (a permission
+    error, say) is a real failure and must not trigger the unscoped retry.
+    See PENDING_LEGACY_SQL for when this fallback expires.
+    """
+    if not stderr or "applies_to" not in stderr:
+        return False
+    return "42703" in stderr or 'column "applies_to" does not exist' in stderr
+
+
 def _pending_from_db() -> str | None:
     """Query the optional backend's `pending` table. None if unavailable.
 
@@ -757,13 +1091,16 @@ def _pending_from_db() -> str | None:
             print("[session_start] pending: unparseable connection string", file=sys.stderr)
             return None
 
-        result = subprocess.run(
-            ["psql", "-t", "-A", "-F", "\t", "-c", PENDING_SQL],
-            capture_output=True,
-            text=True,
-            timeout=PENDING_TIMEOUT_S,
-            env=env,
-        )
+        result = _run_psql(env, _counts_sql(), _items_sql())
+        render = _render_pending
+        if result.returncode != 0 and _is_missing_applies_to(result.stderr):
+            print(
+                "[session_start] pending: backend has no applies_to column; "
+                "using the unscoped query (apply the backend's migrations)",
+                file=sys.stderr,
+            )
+            result = _run_psql(env, PENDING_LEGACY_SQL)
+            render = _render_pending_legacy
         if result.returncode != 0:
             # stderr can echo the target host but never the password (it is
             # passed via PGPASSWORD), so it is safe — and useful — to surface.
@@ -773,7 +1110,7 @@ def _pending_from_db() -> str | None:
                 file=sys.stderr,
             )
             return None
-        return _render_pending_rows(result.stdout)
+        return render(result.stdout)
     except Exception as e:
         # Log the exception TYPE only. Several exception strings (notably
         # subprocess.TimeoutExpired) embed the full argv, and a future edit
@@ -1498,10 +1835,11 @@ def build_groups(
     config: list[str],
     dedup: list[str],
     brain: list[str],
+    orphans: list[str],
     hook_drift: list[str],
 ) -> list[MsgGroup]:
     """main()'s groups, in output order. Correctness alerts (config, brain,
-    hook_drift) have no rank and never degrade; the rest degrade
+    orphans, hook_drift) have no rank and never degrade; the rest degrade
     cheapest-first: evolve nudges, then decay, sync, dedup."""
     return [
         MsgGroup("sync", sync, rank=2),
@@ -1510,6 +1848,7 @@ def build_groups(
         MsgGroup("config", config),
         MsgGroup("dedup", dedup, rank=3),
         MsgGroup("brain", brain),
+        MsgGroup("orphans", orphans),
         MsgGroup("hook_drift", hook_drift),
     ]
 
@@ -1640,6 +1979,9 @@ def main():
     # Brain check — verify Supabase connectivity
     brain_msgs = brain_check()
 
+    # Orphan drift — memory files whose pg_id has no live entity (silent at 0)
+    orphan_msgs = orphan_drift()
+
     # Deployed-hook drift — silent unless CRAFT_CONFIG_REPO is set
     hook_msgs = hook_drift()
 
@@ -1659,6 +2001,7 @@ def main():
         config=config_sync_msgs,
         dedup=dedup_msgs,
         brain=brain_msgs,
+        orphans=orphan_msgs,
         hook_drift=hook_msgs,
     )
     print(render_stdout(groups, resumed, STDOUT_OVERFLOW_FILE))
