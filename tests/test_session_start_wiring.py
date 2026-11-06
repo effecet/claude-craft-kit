@@ -38,13 +38,20 @@ def test_every_check_reaches_stdout(tmp_path: Path, monkeypatch, capsys) -> None
         monkeypatch.setattr(ss, name, lambda *a, _s=sentinel, **k: [_s])
     monkeypatch.setattr(ss, "init_state", lambda: ({}, False))
     monkeypatch.setattr(ss, "write_state", lambda state: None)
-    monkeypatch.setattr(ss, "build_brief", lambda state, resumed: "brief")
+    briefs: list[dict] = []
+    monkeypatch.setattr(
+        ss, "build_brief", lambda state, resumed, **k: briefs.append(k) or "brief"
+    )
+    monkeypatch.setattr(ss, "pending_section", lambda: "## Pending\nSENTINEL\n")
     monkeypatch.setattr(ss, "BRIEF_FILE", tmp_path / "brief.md")
     monkeypatch.setattr(ss, "STDOUT_OVERFLOW_FILE", tmp_path / "overflow.txt")
 
     ss.main()
 
     out = capsys.readouterr().out
+    # The pending section is computed once, concurrently, and handed to the
+    # brief rather than re-queried there.
+    assert briefs == [{"pending": "## Pending\nSENTINEL\n"}]
     missing = [s for s in CHECKS.values() if s not in out]
     assert missing == [], f"checks not wired into main(): {missing}"
     assert out.rstrip().splitlines()[-1].startswith("stdout: ")

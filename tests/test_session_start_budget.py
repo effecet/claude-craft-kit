@@ -215,7 +215,8 @@ def test_main_passes_orphan_drift_output_as_the_orphans_group(monkeypatch, tmp_p
     variable, so a wrong-name slip in main() goes red."""
     monkeypatch.setattr(ss, "init_state", lambda: (ss.make_fresh_state(), False))
     monkeypatch.setattr(ss, "write_state", lambda state: None)
-    monkeypatch.setattr(ss, "build_brief", lambda state, resumed: "brief")
+    monkeypatch.setattr(ss, "build_brief", lambda state, resumed, **k: "brief")
+    monkeypatch.setattr(ss, "pending_section", lambda: "## Pending\nNone.\n")
     monkeypatch.setattr(ss, "BRIEF_FILE", tmp_path / "brief.md")
     for name in (
         "brain_sync", "memory_decay", "evolve_check",

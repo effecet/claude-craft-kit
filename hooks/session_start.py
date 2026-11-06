@@ -15,15 +15,18 @@ import math
 import os
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import sys
 import time
 import urllib.parse
 from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import NamedTuple, cast
 
 from _state import make_fresh_state
 from common import resolve_connection_string
@@ -613,6 +616,51 @@ def dedup_warning() -> list[str]:
 # ── Brain connectivity check (optional memory backend) ───────────────────────
 
 
+BRAIN_CHECK_TIMEOUT_S = 10
+
+
+def _run_in_own_group(
+    cmd: list[str], timeout: float
+) -> subprocess.CompletedProcess[str]:
+    """subprocess.run, but a timeout kills the command's whole process group.
+
+    `make` hands its pipes to the recipe's children (a node process for the
+    backend's status target). subprocess.run kills only `make` on timeout, then
+    waits for EOF on pipes those children still hold, so a hung child stretched
+    the 10s budget to however long it lived. Raises TimeoutExpired like run().
+
+    Process groups are POSIX. Where os.killpg does not exist (Windows) it falls
+    back to killing the direct child only, as subprocess.run would. A child
+    that left the group (setsid) can still hold the pipes, so the drain after
+    the kill is bounded too.
+    """
+    with subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    ) as proc:
+        try:
+            out, err = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                if hasattr(os, "killpg"):
+                    os.killpg(proc.pid, signal.SIGKILL)
+                else:
+                    proc.kill()
+            except ProcessLookupError:
+                pass  # the group exited before the kill
+            except PermissionError:
+                proc.kill()  # a member we may not signal: at least stop the child
+            try:
+                proc.communicate(timeout=1)
+            except subprocess.TimeoutExpired:
+                pass  # a setsid'd descendant still holds the pipes; give up
+            raise
+    return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
+
+
 def brain_check() -> list[str]:
     """Verify the optional memory backend is reachable via its `make` target.
 
@@ -628,11 +676,9 @@ def brain_check() -> list[str]:
         return msgs
 
     try:
-        result = subprocess.run(
+        result = _run_in_own_group(
             ["make", "-C", str(MEMORY_REPO_DIR), "status-remote"],
-            capture_output=True,
-            text=True,
-            timeout=10,
+            BRAIN_CHECK_TIMEOUT_S,
         )
         if result.returncode == 0 and "tier" in result.stdout.lower():
             # Parse tier counts from table output
@@ -652,9 +698,13 @@ def brain_check() -> list[str]:
             err = result.stderr.strip()[:100] if result.stderr else "unknown error"
             msgs.append(f"🧠 Brain: ❌ memory backend unreachable — {err}")
     except subprocess.TimeoutExpired:
-        msgs.append("🧠 Brain: ❌ memory backend check timed out (10s)")
+        msgs.append(
+            f"🧠 Brain: ❌ memory backend check timed out ({BRAIN_CHECK_TIMEOUT_S}s)"
+        )
     except Exception as e:
-        msgs.append(f"🧠 Brain: ⚠️ check failed — {e}")
+        # Type only: exception strings can embed argv, and argv has carried a
+        # connection string before.
+        msgs.append(f"🧠 Brain: ⚠️ check failed — {type(e).__name__}")
 
     return msgs
 
@@ -1144,10 +1194,83 @@ def pending_section() -> str:
     return fallback or "## Pending\nNone.\n"
 
 
+# ── Concurrent DB-bound checks ───────────────────────────────────────────────
+
+# The pending brief when pending_section itself RAISES (it is fail-open, so
+# this is only a backstop). Not "None." so that an unexpected crash is not
+# mistaken for an empty queue. pending_section's own handled failures (DB down,
+# no pending.md) still render "None.", by the zero-setup design.
+PENDING_UNAVAILABLE = "## Pending\nunavailable (check failed)\n"
+
+
+class DbChecks(NamedTuple):
+    """Results of _run_db_checks. Named, because brain and orphans have the
+    same type and a positional swap would type-check and route each one into
+    the other's output group."""
+
+    brain: list[str]
+    orphans: list[str]
+    pending: str
+
+
+def _run_db_checks() -> DbChecks:
+    """Run brain_check, orphan_drift and pending_section concurrently.
+
+    Each waits on its own subprocess timeout, so in sequence an unreachable
+    backend cost the sum of the three and concurrently it costs the slowest.
+    None of them writes state another reads. One caveat: orphan_drift's import
+    of the backend's memory_dedup extends sys.path while the other threads may
+    be importing; the import lock serialises the imports themselves, and the
+    same extension already happened before pending_section when the checks ran
+    in sequence. With BRAIN_ENABLED off, the
+    first two return at once and only the pending.md read remains.
+
+    Each check already fails open; the per-future guard is a backstop so one
+    check that raises can never take the other two with it. It logs the
+    exception TYPE only: several exception strings (TimeoutExpired among them)
+    embed argv, and argv has carried a connection string before.
+
+    Must run after memory_decay, which can rewrite the memory files that
+    orphan_drift reads.
+    """
+    checks = (
+        ("brain", brain_check),
+        ("orphans", orphan_drift),
+        ("pending", pending_section),
+    )
+    with ThreadPoolExecutor(max_workers=len(checks)) as pool:
+        futures = [(name, pool.submit(fn)) for name, fn in checks]
+    results: dict[str, list[str] | str] = {}
+    for name, future in futures:
+        try:
+            results[name] = future.result()
+        except Exception as exc:
+            print(
+                f"[session_start] {name} check failed: {type(exc).__name__}",
+                file=sys.stderr,
+            )
+            results[name] = _db_check_fallback(name, exc)
+    return DbChecks(
+        brain=cast(list[str], results["brain"]),
+        orphans=cast(list[str], results["orphans"]),
+        pending=cast(str, results["pending"]),
+    )
+
+
+def _db_check_fallback(name: str, exc: Exception) -> list[str] | str:
+    if name == "brain":
+        return [f"🧠 Brain: ⚠️ check failed — {type(exc).__name__}"]
+    if name == "orphans":
+        return []
+    return PENDING_UNAVAILABLE
+
+
 # ── Brief builder ─────────────────────────────────────────────────────────────
 
 
-def build_brief(state: dict, resumed: bool) -> str:
+def build_brief(state: dict, resumed: bool, pending: str | None = None) -> str:
+    """Build the session brief. `pending` is the already-rendered pending
+    section from _run_db_checks; when None it is queried here."""
     now = datetime.now()
     sections = [f"# Session Brief — {now.strftime('%Y-%m-%d %H:%M')}\n"]
 
@@ -1189,7 +1312,7 @@ def build_brief(state: dict, resumed: bool) -> str:
     sections.append("## Git\n" + "\n".join(git_items) + "\n")
 
     # Pending items
-    sections.append(pending_section())
+    sections.append(pending if pending is not None else pending_section())
 
     # Recent learnings (last 3 entries)
     if LEARNINGS.exists():
@@ -1976,18 +2099,18 @@ def main():
     # Dedup warning — detect dot-vs-hyphen encoding duplicates
     dedup_msgs = dedup_warning()
 
-    # Brain check — verify Supabase connectivity
-    brain_msgs = brain_check()
-
-    # Orphan drift — memory files whose pg_id has no live entity (silent at 0)
-    orphan_msgs = orphan_drift()
+    # Brain check (backend connectivity), orphan drift (memory files whose
+    # pg_id has no live entity, silent at 0) and the pending brief, run
+    # concurrently: each waits on the backend, so an unreachable one costs one
+    # timeout, not three.
+    db = _run_db_checks()
 
     # Deployed-hook drift — silent unless CRAFT_CONFIG_REPO is set
     hook_msgs = hook_drift()
 
     write_state(state)  # persist updated counters
 
-    brief = build_brief(state, resumed)
+    brief = build_brief(state, resumed, pending=db.pending)
     BRIEF_FILE.parent.mkdir(parents=True, exist_ok=True)
     BRIEF_FILE.write_text(brief)
 
@@ -2000,8 +2123,8 @@ def main():
         evolve=evolve_msgs,
         config=config_sync_msgs,
         dedup=dedup_msgs,
-        brain=brain_msgs,
-        orphans=orphan_msgs,
+        brain=db.brain,
+        orphans=db.orphans,
         hook_drift=hook_msgs,
     )
     print(render_stdout(groups, resumed, STDOUT_OVERFLOW_FILE))
