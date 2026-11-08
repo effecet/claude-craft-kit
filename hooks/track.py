@@ -33,7 +33,8 @@ STATE_FILE = CLAUDE_DIR / "session/state.json"
 FRICTION_LOG = CLAUDE_DIR / "session/friction.jsonl"
 # Runs from track.py's own directory: `make install` copies hooks/ as a unit.
 TOKEN_TRACKER = Path(__file__).resolve().parent / "token_tracker.py"
-BACKUP_SCRIPT = CLAUDE_DIR / "hooks/backup_hook.py"
+# `make install` copies hooks/optional/ beside track.py.
+BACKUP_SCRIPT = Path(__file__).resolve().parent / "optional" / "backup_hook.py"
 PYTHON_VENV = Path.home() / ".venv/bin/python"
 
 # When false (default), the optional intra-session backup and the
@@ -178,9 +179,16 @@ def read_state() -> dict:
 
 
 def write_state(state: dict) -> None:
+    # Temp file + rename, so a kill mid-write never leaves an empty state.json.
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f, indent=2)
+    data = json.dumps(state, indent=2)
+    tmp = STATE_FILE.with_name(f"{STATE_FILE.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(data)
+        os.replace(tmp, STATE_FILE)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def _archive_and_reset_if_day_changed(state: dict) -> dict:
@@ -215,8 +223,10 @@ def _archive_and_reset_if_day_changed(state: dict) -> dict:
 
 
 def run_token_report(transcript_path: str) -> None:
-    # Guard: an install that copied track.py alone has no token_tracker.py.
+    # An install that copied track.py alone has no token_tracker.py: say so
+    # once per report turn instead of printing nothing.
     if not TOKEN_TRACKER.exists():
+        print(f"[track] {TOKEN_TRACKER.name} not found beside track.py; no token report", file=sys.stderr)
         return
     try:
         # This interpreter, not a bare `python3`: the tracker needs 3.11+.
@@ -334,19 +344,19 @@ def _resolve_transcript(hook_data: dict, state: dict) -> str:
     return tp
 
 
-def _step_token_report(count: int, transcript_path: str) -> bool:
+def _step_token_report(count: int, transcript_path: str) -> None:
     """Print token summary every TOKEN_REPORT_INTERVAL messages.
 
-    True when token_tracker ran (and so may have written "tokens")."""
+    main() calls this after its own write_state: token_tracker reads and
+    rewrites the same state file, so it must see this turn's count and be the
+    last writer, or main's save would wipe the "tokens" it wrote."""
     if count % TOKEN_REPORT_INTERVAL != 0:
-        return False
-    ran = bool(transcript_path)
-    if ran:
+        return
+    if transcript_path:
         run_token_report(transcript_path)
     else:
         print(f"[i] Session checkpoint: {count} messages")
     _desktop_notify("Claude Code", f"Session checkpoint: {count} messages")
-    return ran
 
 
 def _step_backup(count: int) -> None:
@@ -489,12 +499,6 @@ def main() -> None:
 
     user_prompt = hook_data.get("prompt", "")
 
-    # token_tracker writes "tokens" to the state file itself; keep that write
-    # instead of overwriting it with this run's older copy below. Only after it
-    # ran: on other turns the file can still hold yesterday's state, whose
-    # tokens a day reset just dropped.
-    if _step_token_report(count, transcript_path) and "tokens" in (fresh := read_state()):
-        state["tokens"] = fresh["tokens"]
     _step_backup(count)
     _step_staleness(count, state)
     _step_threshold_prompt(count, state)
@@ -503,6 +507,8 @@ def main() -> None:
     _step_breadcrumb(count, state)
 
     write_state(state)
+    # Last, after the save: see _step_token_report.
+    _step_token_report(count, transcript_path)
 
 
 if __name__ == "__main__":

@@ -69,9 +69,16 @@ def read_state() -> dict:
 
 
 def write_state(state: dict) -> None:
+    # Temp file + rename, so a kill mid-write never leaves an empty state.json.
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f, indent=2)
+    data = json.dumps(state, indent=2)
+    tmp = STATE_FILE.with_name(f"{STATE_FILE.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(data)
+        os.replace(tmp, STATE_FILE)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 # ── Transcript reader ─────────────────────────────────────────────────────────

@@ -124,8 +124,9 @@ def test_end_to_end_writes_state_under_claude_dir(tmp_path: Path) -> None:
 def test_track_keeps_the_tokens_token_tracker_wrote(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # track.py reads state, runs token_tracker (which writes "tokens"), then
-    # writes its own copy: that copy must not wipe the fresh tokens.
+    # token_tracker writes "tokens" to the same file track.py saves, so it runs
+    # after that save: track's copy must not wipe the fresh tokens, and the
+    # tracker must see this turn's count ("Messages" was one behind before).
     state_file = tmp_path / "state.json"
     state_file.write_text(json.dumps({"user_message_count": track.TOKEN_REPORT_INTERVAL - 1}))
     monkeypatch.setattr(track, "STATE_FILE", state_file)
@@ -135,8 +136,11 @@ def test_track_keeps_the_tokens_token_tracker_wrote(
                  "_step_friction", "_step_goodbye", "_step_breadcrumb"):
         monkeypatch.setattr(track, step, lambda *a, **k: None)
 
+    seen: list[int] = []
+
     def fake_report(path: str) -> None:
         on_disk = json.loads(state_file.read_text())
+        seen.append(on_disk["user_message_count"])
         on_disk["tokens"] = {"input_tokens": 42}
         state_file.write_text(json.dumps(on_disk))
 
@@ -146,6 +150,7 @@ def test_track_keeps_the_tokens_token_tracker_wrote(
     saved = json.loads(state_file.read_text())
     assert saved["tokens"] == {"input_tokens": 42}
     assert saved["user_message_count"] == track.TOKEN_REPORT_INTERVAL
+    assert seen == [track.TOKEN_REPORT_INTERVAL]
 
 
 def _isolate_track(monkeypatch: pytest.MonkeyPatch, state_file: Path) -> None:
@@ -183,5 +188,38 @@ def test_token_report_runs_under_this_interpreter(monkeypatch: pytest.MonkeyPatc
 
 
 def test_track_and_token_tracker_share_one_state_file() -> None:
-    # The tokens copy-back in track.main only works if both read one file.
+    # token_tracker updates the state track.main just saved: one file for both.
     assert track.STATE_FILE == tt.STATE_FILE
+
+
+def test_missing_tracker_says_so(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(track, "TOKEN_TRACKER", tmp_path / "token_tracker.py")
+    monkeypatch.setattr(track.subprocess, "run", lambda *a, **k: pytest.fail("ran a missing tracker"))
+    track.run_token_report("t.jsonl")
+    assert "token_tracker.py not found beside track.py" in capsys.readouterr().err
+
+
+def test_backup_script_is_where_make_install_puts_it() -> None:
+    # `make install` copies hooks/optional/ next to track.py.
+    assert track.BACKUP_SCRIPT == HOOKS / "optional" / "backup_hook.py"
+    assert track.BACKUP_SCRIPT.exists()
+
+
+@pytest.mark.parametrize("mod", [track, tt], ids=["track", "token_tracker"])
+def test_failed_write_keeps_the_old_state(
+    mod, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_file = tmp_path / "state.json"
+    state_file.write_text('{"user_message_count": 7}')
+    monkeypatch.setattr(mod, "STATE_FILE", state_file)
+
+    def boom(*a, **k):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(mod.os, "replace", boom)
+    with pytest.raises(OSError):
+        mod.write_state({"user_message_count": 8})
+    assert json.loads(state_file.read_text()) == {"user_message_count": 7}
+    assert [p.name for p in tmp_path.iterdir()] == ["state.json"]

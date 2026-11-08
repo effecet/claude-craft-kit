@@ -147,7 +147,7 @@
       <g class="node" id="node-guards" data-key="guards">
         <rect x="92" y="360" width="256" height="66" rx="10"/>
         <text class="lbl" x="220" y="376">PreToolUse guards</text>
-        <text class="guard" id="g0" x="125" y="398">gitleaks</text>
+        <text class="guard" id="g0" x="125" y="398">no_bypass</text>
         <text class="guard" id="g1" x="200" y="398">pr_scan</text>
         <text class="guard" id="g2" x="265" y="398">ruff</text>
         <text class="guard" id="g3" x="140" y="414">prd_guard</text>
@@ -185,7 +185,7 @@ const INFO = {
   start:  ["SessionStart hook","SessionStart","<code>session_start.py</code> — initializes or resumes your session state, prints git context, and surfaces any open specs so you pick up where you left off."],
   prompt: ["UserPromptSubmit hooks","Per message","<code>track.py</code> + <code>consume_prompt.py</code> — count messages, report token usage, detect friction & “goodbye” phrases (to offer wrap-up), and surface pending prompts."],
   work:   ["the work","Claude works","Claude plans → implements → tests the change. The hooks don't get in the way here — they bracket the work on either side."],
-  guards: ["PreToolUse guards","Safety guards","Fire <b>before</b> each tool call and can block it: <code>gitleaks</code> & <code>pr_security_scan</code> (no leaked secrets), <code>ruff_workflow</code> (lint before commit), <code>prd_guard</code> (prod-path warning)."],
+  guards: ["PreToolUse guards","Safety guards","Fire <b>before</b> each tool call and can block it: <code>hook_bypass_guard</code> (no skipping the git pre-commit secret scan, which gitleaks runs on every commit), <code>pr_security_scan</code> (no leaked secrets in a PR), <code>ruff_workflow</code> (lint before commit), <code>prd_guard</code> (prod-path warning)."],
   gate:   ["the gate","Tiered validation","<code>validate_tier.py</code> reads the diff and picks a review tier instead of eyeballing it: <b>Skip</b> (docs, zero effective LOC), <b>Light</b> (&lt;30 LOC → 2 reviewers), <b>Full</b> (sensitive paths / features → 6 reviewers)."],
   stop:   ["Stop hook","Exit gate","<code>stop_gate.py</code> blocks a clean exit until a wrap-up runs on a substantial session — so learnings and commits aren't lost on the way out."],
   end:    ["done","Session ends","Learnings captured, work committed. The loop is closed — and the next session resumes the state this one left behind."],

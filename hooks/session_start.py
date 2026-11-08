@@ -1492,8 +1492,59 @@ GITLEAKS_MIN = (8, 19)  # `gitleaks git`, which the pre-commit hook runs
 MIN_TEXT = ".".join(map(str, GITLEAKS_MIN))
 
 
+def _local_hooks_path_bypass(
+    ours: Path, home: Path, cwd: Path | None, env: dict[str, str]
+) -> list[str]:
+    """Warn when the repo the session starts in skips the global hook.
+
+    A repo-level core.hooksPath (Husky sets one) replaces the global one, so
+    git never runs our pre-commit there. That is fine only when the repo's own
+    pre-commit hands over to ours, which is what the install message asks for.
+    Reads the EFFECTIVE value, so config.worktree and include files count too.
+    """
+    try:
+        res = subprocess.run(
+            ["git", "config", "--get", "core.hooksPath"],
+            capture_output=True, text=True, errors="replace", timeout=5, env=env,
+            cwd=cwd,
+        )
+        top = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, errors="replace", timeout=5, env=env,
+            cwd=cwd,
+        ).stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    local = res.stdout.strip()
+    if res.returncode != 0 or not local or not top:
+        return []
+    # git expands only a leading ~, against HOME (the `home` this check uses).
+    local_dir = Path(str(home) + local[1:]) if local == "~" or local.startswith("~/") else Path(local)
+    if not local_dir.is_absolute():
+        local_dir = Path(top) / local_dir
+    try:
+        if local_dir.resolve() == ours.resolve():
+            return []
+        hook_text = (local_dir / "pre-commit").read_text(errors="replace")
+    except (OSError, RuntimeError):
+        hook_text = ""
+    # Hands over only if a non-comment line names OUR pre-commit (absolute or
+    # ~/ form); another project's git-hooks/pre-commit does not count.
+    names = {f"{ours}/pre-commit"}
+    if ours.is_relative_to(home):
+        names.add(f"~/{ours.relative_to(home)}/pre-commit")
+    for line in hook_text.splitlines():
+        if not line.lstrip().startswith("#") and any(n in line for n in names):
+            return []
+    return [
+        f"⚠️ commits in {top} are NOT scanned for secrets: its local core.hooksPath "
+        f"({local}) skips the global hook — add `exec \"{ours}/pre-commit\" \"$@\"` "
+        "to its pre-commit."
+    ]
+
+
 def secret_scan_status(
-    home: Path | None = None, env: dict[str, str] | None = None
+    home: Path | None = None, env: dict[str, str] | None = None, cwd: Path | None = None
 ) -> list[str]:
     """Warn when a global pre-commit secret scan you rely on is not really running.
 
@@ -1501,8 +1552,9 @@ def secret_scan_status(
     binary (one stderr line per commit, easy to miss) and CLOSED on a gitleaks
     too old for `gitleaks git`, so a machine can sit unscanned or stuck for
     weeks. Checks that the global core.hooksPath points at CRAFT_GIT_HOOKS_DIR,
-    then finds gitleaks on PATH or GITLEAKS_HOOK_SEARCH_PATH. Silent unless
-    CRAFT_GIT_HOOKS_DIR is set.
+    that the repo in `cwd` (default: the session's) does not skip it with a
+    local core.hooksPath, then finds gitleaks on PATH or
+    GITLEAKS_HOOK_SEARCH_PATH. Silent unless CRAFT_GIT_HOOKS_DIR is set.
     """
     home = home or Path.home()
     env = env if env is not None else dict(os.environ)
@@ -1540,13 +1592,15 @@ def secret_scan_status(
     if configured is None:
         msgs.append(
             "⚠️ commits are NOT scanned for secrets: no global core.hooksPath — "
-            f"run `git config --global core.hooksPath {ours}`."
+            f"run `make install-git-hooks` in claude-craft-kit (its target must be {ours})."
         )
     elif not same:
         msgs.append(
             f"⚠️ commits are NOT scanned for secrets: global core.hooksPath is "
             f"{current}, not {ours}."
         )
+    else:
+        msgs += _local_hooks_path_bypass(ours, home, cwd, env)
 
     search = env.get(
         "GITLEAKS_HOOK_SEARCH_PATH",

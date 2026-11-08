@@ -1,8 +1,8 @@
 """
 ~/.claude/hooks/shell_words.py
 
-The shell-command parser shared by the PreToolUse:Bash guards
-(coauthor_push_guard.py, hook_bypass_guard.py). It turns a Bash command into
+The shell-command parser used by the PreToolUse:Bash guard
+hook_bypass_guard.py. It turns a Bash command into
 commands split on `;`, `&&`, `||`, `|`, `&`, `(`, `)` and newlines, and finds
 the `git` subcommand in each.
 

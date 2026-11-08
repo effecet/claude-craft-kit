@@ -15,7 +15,7 @@
     ],
     "PreToolUse": [
       { "matcher": "Bash", "hooks": [
-        { "type": "command", "command": "bash ~/.claude/hooks/gitleaks_guard.sh" },
+        { "type": "command", "command": "python3 ~/.claude/hooks/hook_bypass_guard.py" },
         { "type": "command", "command": "bash ~/.claude/hooks/pr_security_scan.sh" },
         { "type": "command", "command": "python3 ~/.claude/hooks/ruff_workflow_guard.py" }
       ] },

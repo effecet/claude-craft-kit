@@ -27,9 +27,19 @@ def home(tmp_path: Path) -> Path:
     return tmp_path
 
 
+@pytest.fixture(autouse=True)
+def _outside_any_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # secret_scan_status also checks the repo the session starts in (cwd):
+    # never let that be the developer's own checkout.
+    monkeypatch.chdir(tmp_path)
+
+
 def _env(home: Path, path: str = "/usr/bin:/bin") -> dict[str, str]:
     return {
-        **os.environ,
+        # An inherited GIT_DIR / GIT_WORK_TREE (pytest run from a git hook)
+        # would point these git calls at the real checkout.
+        **{k: v for k, v in os.environ.items() if not k.startswith("GIT_")},
+        "GIT_CEILING_DIRECTORIES": str(home.parent),
         "HOME": str(home),
         "PATH": path,
         "GIT_CONFIG_GLOBAL": str(home / "gitconfig"),
@@ -164,3 +174,89 @@ def test_machine_without_claude_git_hooks_is_silent(tmp_path: Path) -> None:
 def test_wired_into_the_brief() -> None:
     src = (Path(__file__).resolve().parent.parent / "hooks" / "session_start.py").read_text()
     assert "secret_scan_status()" in src
+
+
+def test_not_installed_message_names_the_make_target(home: Path) -> None:
+    env = _env(home, _fake_gitleaks(home, "8.30.1"))
+    msgs = ss.secret_scan_status(home=home, env=env)
+    assert "make install-git-hooks" in msgs[0]
+
+
+def _repo_with_local_hooks_path(home: Path, env: dict[str, str], pre_commit: str | None) -> Path:
+    repo = home / "proj"
+    subprocess.run(["git", "init", "-q", str(repo)], check=True, env=env)
+    local = repo / ".husky"
+    local.mkdir()
+    if pre_commit is not None:
+        (local / "pre-commit").write_text(pre_commit)
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "--local", "core.hooksPath", ".husky"],
+        check=True, env=env,
+    )
+    return repo
+
+
+def test_warns_when_the_session_repo_has_its_own_hooks_path(home: Path) -> None:
+    # A local core.hooksPath replaces the global one: git never runs our scan there.
+    env = _env(home, _fake_gitleaks(home, "8.30.1"))
+    _set_hooks_path(env, str(home / ".claude" / "git-hooks"))
+    repo = _repo_with_local_hooks_path(home, env, "#!/bin/sh\nnpx lint-staged\n")
+    msgs = ss.secret_scan_status(home=home, env=env, cwd=repo)
+    assert len(msgs) == 1
+    assert "local core.hooksPath" in msgs[0]
+    assert str(home / ".claude" / "git-hooks" / "pre-commit") in msgs[0]
+
+
+def test_silent_when_the_local_hook_hands_over(home: Path) -> None:
+    env = _env(home, _fake_gitleaks(home, "8.30.1"))
+    _set_hooks_path(env, str(home / ".claude" / "git-hooks"))
+    ours = home / ".claude" / "git-hooks" / "pre-commit"
+    repo = _repo_with_local_hooks_path(home, env, f'#!/bin/sh\nexec "{ours}" "$@"\n')
+    assert ss.secret_scan_status(home=home, env=env, cwd=repo) == []
+
+
+def test_silent_outside_a_repo(home: Path) -> None:
+    env = _env(home, _fake_gitleaks(home, "8.30.1"))
+    _set_hooks_path(env, str(home / ".claude" / "git-hooks"))
+    outside = home / "plain"
+    outside.mkdir()
+    assert ss.secret_scan_status(home=home, env=env, cwd=outside) == []
+
+
+def test_a_comment_naming_our_hook_is_not_a_handover(home: Path) -> None:
+    env = _env(home, _fake_gitleaks(home, "8.30.1"))
+    _set_hooks_path(env, str(home / ".claude" / "git-hooks"))
+    ours = home / ".claude" / "git-hooks" / "pre-commit"
+    repo = _repo_with_local_hooks_path(home, env, f"#!/bin/sh\n# later: exec {ours}\nnpx lint-staged\n")
+    assert len(ss.secret_scan_status(home=home, env=env, cwd=repo)) == 1
+
+
+def test_another_projects_git_hooks_dir_is_not_a_handover(home: Path) -> None:
+    env = _env(home, _fake_gitleaks(home, "8.30.1"))
+    _set_hooks_path(env, str(home / ".claude" / "git-hooks"))
+    repo = _repo_with_local_hooks_path(home, env, '#!/bin/sh\nexec ./tools/git-hooks/pre-commit "$@"\n')
+    assert len(ss.secret_scan_status(home=home, env=env, cwd=repo)) == 1
+
+
+def test_tilde_form_handover_counts(home: Path) -> None:
+    env = _env(home, _fake_gitleaks(home, "8.30.1"))
+    _set_hooks_path(env, str(home / ".claude" / "git-hooks"))
+    repo = _repo_with_local_hooks_path(home, env, '#!/bin/sh\nexec ~/.claude/git-hooks/pre-commit "$@"\n')
+    assert ss.secret_scan_status(home=home, env=env, cwd=repo) == []
+
+
+def test_hooks_path_from_an_include_file_counts(home: Path) -> None:
+    # `git config --local` skips include files; git itself does not.
+    env = _env(home, _fake_gitleaks(home, "8.30.1"))
+    _set_hooks_path(env, str(home / ".claude" / "git-hooks"))
+    repo = home / "proj"
+    subprocess.run(["git", "init", "-q", str(repo)], check=True, env=env)
+    (repo / ".husky").mkdir()
+    (repo / ".husky" / "pre-commit").write_text("#!/bin/sh\nnpx lint-staged\n")
+    inc = home / "extra.gitconfig"
+    inc.write_text("[core]\n\thooksPath = .husky\n")
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "--local", "include.path", str(inc)],
+        check=True, env=env,
+    )
+    assert len(ss.secret_scan_status(home=home, env=env, cwd=repo)) == 1

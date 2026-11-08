@@ -83,6 +83,7 @@ export BACKUP_BRANCH="main"
 # export CRAFT_CANARY_FILE="${HOME}/.claude/session/canary_last_run"
 # export CRAFT_CANARY_MAX_AGE_H="3"
 #
-# Secret scan: the global git hooks dir core.hooksPath must point at (the
-# check also verifies a recent enough gitleaks is installed).
+# Secret scan: the global git hooks dir core.hooksPath must point at
+# (`make install-git-hooks` installs git-hooks/ there; the check also verifies
+# a recent enough gitleaks is installed).
 # export CRAFT_GIT_HOOKS_DIR="${HOME}/.claude/git-hooks"
