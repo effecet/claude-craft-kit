@@ -1,0 +1,131 @@
+#!/bin/sh
+# ~/.claude/git-hooks/dispatch — the global git hook dispatcher.
+#
+# `make install-git-hooks` sets the global core.hooksPath to this directory.
+# Every hook name here is a symlink to this file, which branches on its name:
+#
+#   pre-commit  gitleaks scans the exact index being committed, then chains.
+#   any other   chains straight away.
+#
+# "Chains" = exec the repo's own <git-common-dir>/hooks/<name> if it is
+# executable, with argv and stdin intact, so its exit status is the hook's.
+# A global core.hooksPath otherwise silently disables every repo's own hooks.
+#
+# Why a git hook and not the Claude Code PreToolUse guard it replaces: a guard
+# that runs BEFORE a Bash command has to guess what the commit will contain,
+# and cannot see files the command creates, aliases, GIT_DIR, `cd $VAR`. Here
+# git hands us the final index (GIT_INDEX_FILE, including the temporary ones
+# behind `commit -a` and `commit <paths>`), for every commit on the machine.
+#
+# NOT scanned, because git runs no pre-commit for them: a merge without
+# conflicts (pre-merge-commit), `git am`, `revert`, and `rebase --continue`
+# after a conflict fix. The last one is new content; CI's gitleaks history
+# scan is the backstop. The gap predates this hook (the old guard only ever
+# saw `git commit`).
+#
+# Hook names deliberately NOT linked, because their mere presence changes what
+# git does: push-to-checkout (replaces receive.denyCurrentBranch=updateInstead),
+# proc-receive (a protocol, not a check) and fsmonitor-watchman. A repo's own
+# copy of one of those does not run under the global core.hooksPath.
+#
+# Fails closed: an unclean scan blocks. Fails open on exactly one thing: no
+# gitleaks binary at all, which warns — otherwise a machine without gitleaks
+# could not commit anywhere. Lookup: PATH, then GITLEAKS_HOOK_SEARCH_PATH
+# (colon-separated; default below; set it empty to disable the fallback).
+#
+# A repo with its own LOCAL core.hooksPath bypasses this directory entirely;
+# give that repo a pre-commit that runs `exec ~/.claude/git-hooks/pre-commit "$@"`
+# (the link, not `dispatch`: the name is what selects the scan).
+# See tests/test_git_hooks_dispatch.py.
+
+# Runs on every hook git fires in every repo (post-index-change on index
+# writes, reference-transaction per ref update), so the no-local-hook path
+# spawns exactly one process: `git rev-parse`.
+name=${0##*/}
+
+nl='
+'
+if dirs=$(git rev-parse --absolute-git-dir --git-common-dir 2>/dev/null); then
+  gitdir=${dirs%%"$nl"*}
+  common=${dirs#*"$nl"}
+  case $common in /*) ;; *) common="$PWD/$common" ;; esac
+else
+  gitdir='' common=''
+fi
+
+# We exec'd the repo's own hook and it exec'd us again: a local hooksPath
+# wrapper, or .git/hooks linked back here. Chaining again would loop, so a
+# re-entry STOPS CHAINING — and still scans. The marker is a loop breaker,
+# never a scan skip: PIDs are predictable (the hook was measured at the
+# caller's PID + 3), so a forged marker must be able to cost nothing but the
+# repo's own hook, which its owner could simply not have. Keyed on this
+# worktree, this hook and this process, an exec chain (same PID) matches; a
+# commit made from inside a repo hook runs in fresh processes and chains.
+reentry=
+if [ -n "$gitdir" ] && [ "${_GIT_HOOKS_DISPATCH-}" = "$gitdir:$name:$$" ]; then
+  reentry=1
+fi
+
+# A wrapper that CALLS us instead of exec'ing gets a new PID every round, so
+# the marker cannot stop it; this cap does, loudly. A forged depth can only
+# make a commit fail, never pass.
+case ${_GIT_HOOKS_DEPTH-} in '' | *[!0-9]*) depth=1 ;; *) depth=$((_GIT_HOOKS_DEPTH + 1)) ;; esac
+if [ "$depth" -gt 8 ]; then
+  echo "🔴 git hook recursion: a repo hook keeps re-running ~/.claude/git-hooks/$name." >&2
+  echo "   A wrapper must 'exec' it, not call it. Blocked." >&2
+  exit 1
+fi
+
+find_gitleaks() {
+  command -v gitleaks 2>/dev/null && return 0
+  # Editors and GUI git clients often run without Homebrew on PATH.
+  (
+    IFS=:
+    for d in ${GITLEAKS_HOOK_SEARCH_PATH-/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$HOME/bin}; do
+      if [ -n "$d" ] && [ -x "$d/gitleaks" ]; then
+        echo "$d/gitleaks"
+        exit 0
+      fi
+    done
+    exit 1
+  )
+}
+
+scan() {
+  if ! gl=$(find_gitleaks); then
+    echo "⚠️  gitleaks not found — this commit was NOT scanned for secrets." >&2
+    return 0
+  fi
+  # --verbose prints each finding (file, line, rule); --redact keeps the
+  # secret itself out of the terminal and the session transcript.
+  out=$("$gl" git --pre-commit --staged --no-banner --no-color --verbose --redact . 2>&1)
+  rc=$?
+  # gitleaks can exit 0 without having scanned anything (e.g. an internal git
+  # error); only an explicit clean verdict counts as a pass.
+  case $rc:$out in 0:*"no leaks found"*) return 0 ;; esac
+  printf '%s\n' "$out" >&2
+  case $rc:$out in
+    1:*"leaks found:"*)
+      echo "🔴 SECRETS DETECTED in the staged changes; commit blocked." >&2
+      echo "   Remove them. If one is a false positive, tell the user; do not" >&2
+      echo "   edit .gitleaks.toml or skip this hook to get past it." >&2 ;;
+    0:*) echo "🔴 gitleaks did not complete a clean scan; commit blocked." >&2 ;;
+    *'unknown command "git"'*)
+      # Exit 1 too, like a finding: only the text tells them apart.
+      echo "🔴 gitleaks is too old for 'gitleaks git' (needs 8.19+); commit blocked. Upgrade it." >&2 ;;
+    *) echo "🔴 gitleaks failed (exit $rc); commit blocked." >&2 ;;
+  esac
+  return 1
+}
+
+if [ "$name" = "pre-commit" ]; then
+  scan || exit 1
+fi
+
+[ -n "$common" ] && [ -z "$reentry" ] || exit 0
+target="$common/hooks/$name"
+[ -f "$target" ] && [ -x "$target" ] || exit 0
+_GIT_HOOKS_DISPATCH="$gitdir:$name:$$"
+_GIT_HOOKS_DEPTH=$depth
+export _GIT_HOOKS_DISPATCH _GIT_HOOKS_DEPTH
+exec "$target" "$@"

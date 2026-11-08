@@ -56,7 +56,9 @@ See **[docs/WORKFLOW.md](docs/WORKFLOW.md)** for the full walkthrough and the va
 | SessionStart | `session_start.py` | Init/resume session state, git context, open specs + pending work; optional checks (deployed-hook drift, live-hooks branch, untracked config, stale canary, secret-scan hook) via `config.example.sh`; output kept under the 10k hook cap |
 | SessionStart | `mcp_restore_guard.py` | Self-heal: re-register local stdio MCP servers that got dropped from `~/.claude.json` (opt-in via `mcp-restore.json`) |
 | UserPromptSubmit | `track.py`, `consume_prompt.py` | Message counting, token report, friction/goodbye detection, pending prompts |
-| PreToolUse | `gitleaks_guard.sh`, `pr_security_scan.sh` | Block commits/PRs that leak secrets (advisory: scans the current directory's repo, skips with a warning if gitleaks is missing; a git pre-commit hook is the real gate) |
+| git pre-commit | `git-hooks/dispatch` | gitleaks on the exact index of every commit on the machine, Claude's or yours (`make install-git-hooks` sets the global `core.hooksPath`; then chains to each repo's own hook). Warns and lets the commit through only when gitleaks is not installed |
+| PreToolUse | `hook_bypass_guard.py` | Block a Bash command that would skip that scan: `git commit --no-verify`, or moving `core.hooksPath` |
+| PreToolUse | `pr_security_scan.sh` | Secret scan of the branch diff before `gh pr create` |
 | PreToolUse | `prd_guard.sh` | Warn before editing prod-looking paths |
 | PreToolUse | `ruff_workflow_guard.py` | Ruff check before committing in CI repos |
 | (gate) | `validate_tier.py` | Pick the review tier from diff size + sensitive paths |
@@ -97,9 +99,30 @@ cp config.example.sh ~/.claude/config.local.sh   # then source it from your shel
 
 # 3. Wire the hooks — merge settings.example.json's "hooks" block into ~/.claude/settings.json
 
-# 4. (optional) adopt the global instructions
+# 4. Scan every commit for secrets (needs gitleaks 8.19+ on PATH)
+make install-git-hooks
+
+# 5. (optional) adopt the global instructions
 #    review CLAUDE.example.md, then save it as ~/.claude/CLAUDE.md
 ```
+
+**Upgrading from a kit with `gitleaks_guard.sh`**, in this order:
+1. `make install-git-hooks`. Until it has run, the new settings scan nothing.
+2. In your `settings.json`, swap the `gitleaks_guard.sh` line for
+   `hook_bypass_guard.py` (see `settings.example.json`).
+3. Delete `~/.claude/hooks/gitleaks_guard.sh`. `make install` copies files in
+   but never removes old ones, and a settings line pointing at a deleted file
+   errors on every Bash call.
+
+`make install-git-hooks` copies `git-hooks/`; re-run it after pulling a kit
+update that changes it. A repo with its own local `core.hooksPath` (Husky, for
+one) skips the global hook; `session_start.py` warns about it.
+
+**Also changed:** `track.py` now finds the optional backup at
+`hooks/optional/backup_hook.py`, where `make install` puts it. Before, it looked
+in `hooks/` and never ran. With `BRAIN_ENABLED=true` it now runs every
+`BACKUP_INTERVAL` messages and commits and pushes your `CLAUDE_DIR` to its git
+remote. Leave `BRAIN_ENABLED` off, or edit that script, if you don't want that.
 
 Other targets: `make syntax` (check all hooks), `make lint` (ruff + shellcheck),
 `make scan` (gitleaks), `make help`.
@@ -113,14 +136,17 @@ claude-craft-kit/
 ├── README.md
 ├── index.html                  # interactive animated lifecycle (the Pages site)
 ├── LICENSE                     # MIT
-├── Makefile                    # install / syntax / lint / scan
+├── Makefile                    # install / install-git-hooks / syntax / lint / scan
 ├── CLAUDE.example.md           # generified global-instructions skeleton
 ├── config.example.sh           # env config (paths, BRAIN_ENABLED, backend)
 ├── settings.example.json       # Claude Code hook wiring
 ├── mcp-restore.example.json    # example: local MCP servers to self-heal on SessionStart
 ├── .gitleaks.toml              # secret-scan config
 ├── ruff.toml                   # lint config
-├── .github/workflows/ci.yml    # CI: ruff · shellcheck · syntax · pytest
+├── .github/workflows/ci.yml    # CI: ruff · shellcheck · syntax · pytest (with gitleaks)
+├── git-hooks/
+│   ├── dispatch                # global git hook: gitleaks on pre-commit, then the repo's own hook
+│   └── pre-commit, …           # one symlink to dispatch per safe git hook name
 ├── docs/
 │   └── WORKFLOW.md             # the full lifecycle + validation-tier rules
 ├── hooks/
@@ -131,7 +157,7 @@ claude-craft-kit/
 │   ├── consume_prompt.py       # UserPromptSubmit: surface pending prompts
 │   ├── validate_tier.py        # the tiered validation gate
 │   ├── stop_gate.py            # Stop: wrap-up exit gate
-│   ├── gitleaks_guard.sh       # PreToolUse: secret scan before commit
+│   ├── hook_bypass_guard.py    # PreToolUse: stop Bash from skipping the git secret scan
 │   ├── pr_security_scan.sh     # PreToolUse: secret scan before PR
 │   ├── prd_guard.sh            # PreToolUse: prod-path warning
 │   ├── ruff_workflow_guard.py  # PreToolUse: ruff before commit
@@ -139,7 +165,7 @@ claude-craft-kit/
 │   ├── spec_audit.py           # report open specs
 │   ├── _state.py               # session-state schema
 │   ├── common.py               # path + connection-string helpers
-│   ├── shell_words.py          # shell-command parsing for the guards
+│   ├── shell_words.py          # shell-command parsing for hook_bypass_guard
 │   └── optional/               # backend-coupled, BRAIN_ENABLED=false by default
 │       ├── proactive_recall.py # surface relevant memories per prompt
 │       └── backup_hook.py      # generic git backup of your config

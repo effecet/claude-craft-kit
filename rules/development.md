@@ -446,8 +446,7 @@ Origin: a Full-tier gate once lost 3 of 6 reviewers to org limits mid-gate; the 
 ### Does NOT Replace
 
 - `prd_guard.sh` — pre-tool write guard
-- `gitleaks_guard.sh` — pre-bash secrets scan
-- an optional global git `pre-commit` secret-scan hook, if you run one (`session_start.py` checks it when `CRAFT_GIT_HOOKS_DIR` is set)
+- the global git `pre-commit` hook (`git-hooks/dispatch`, `make install-git-hooks`) — gitleaks on every commit's exact index, plus `hook_bypass_guard.py`, which stops Claude's Bash from skipping it (`session_start.py` checks the hook is live when `CRAFT_GIT_HOOKS_DIR` is set)
 - `pr_security_scan.sh` — PR security scan
 
 ---

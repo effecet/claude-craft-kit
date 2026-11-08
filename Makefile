@@ -1,6 +1,8 @@
-.PHONY: help install lint syntax scan clean
+.PHONY: help install install-git-hooks lint syntax scan clean
 
 CLAUDE_DIR ?= $(HOME)/.claude
+# Absolute: a relative core.hooksPath resolves per repo and scans nothing.
+GIT_HOOKS_DIR = $(abspath $(CLAUDE_DIR)/git-hooks)
 
 help:           ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | \
@@ -17,6 +19,23 @@ install:        ## Copy hooks/ + rules/ + commands/ + CLAUDE.example.md into CLA
 	@echo "  1. cp config.example.sh \"$(CLAUDE_DIR)/config.local.sh\" and source it"
 	@echo "  2. merge settings.example.json's \"hooks\" block into \"$(CLAUDE_DIR)/settings.json\""
 	@echo "  3. review CLAUDE.example.md, then save as \"$(CLAUDE_DIR)/CLAUDE.md\" if you want it"
+	@echo "  4. make install-git-hooks, so every commit on this machine is scanned for secrets"
+
+install-git-hooks: ## Scan every commit for secrets: copy git-hooks/ to CLAUDE_DIR, point the global core.hooksPath at it
+	@norm() { p=$$1; case $$p in "~"|"~/"*) p="$$HOME$${p#"~"}" ;; esac; \
+		[ "$$p" = / ] || p=$${p%/}; [ -d "$$p" ] && p=$$(cd "$$p" && pwd -P); printf '%s' "$$p"; }; \
+	current=$$(git config --global --get core.hooksPath); \
+	if [ -n "$$current" ] && [ "$$(norm "$$current")" != "$$(norm "$(GIT_HOOKS_DIR)")" ]; then \
+		echo "❌ global core.hooksPath is already $$current; not overwriting it." >&2; \
+		echo "   Run its pre-commit from $(GIT_HOOKS_DIR)/pre-commit, or unset it and re-run." >&2; \
+		exit 1; \
+	fi
+	@mkdir -p "$(GIT_HOOKS_DIR)"
+	@cp -RP git-hooks/. "$(GIT_HOOKS_DIR)/"
+	@git config --global core.hooksPath "$(GIT_HOOKS_DIR)"
+	@echo "✓ global core.hooksPath → $(GIT_HOOKS_DIR)"
+	@command -v gitleaks >/dev/null 2>&1 || echo "⚠️  gitleaks not on PATH: commits will warn and go through UNSCANNED until you install it"
+	@echo "  A repo with a LOCAL core.hooksPath bypasses it; give that repo a pre-commit running: exec \"$(GIT_HOOKS_DIR)/pre-commit\" \"\$$@\""
 
 syntax:         ## Syntax-check every hook (python + bash), no bytecode written
 	@fail=0; \
@@ -24,14 +43,14 @@ syntax:         ## Syntax-check every hook (python + bash), no bytecode written
 	  python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" "$$f" \
 	    && echo "  ok  $$f" || { echo "  FAIL $$f"; fail=1; }; \
 	done; \
-	for f in $$(find hooks -name '*.sh'); do \
+	for f in $$(find hooks -name '*.sh') git-hooks/dispatch; do \
 	  bash -n "$$f" && echo "  ok  $$f" || { echo "  FAIL $$f"; fail=1; }; \
 	done; \
 	[ $$fail -eq 0 ] && echo "All hooks OK" || exit 1
 
 lint:           ## Lint hooks (ruff for python, shellcheck for bash) if installed
 	@command -v ruff >/dev/null 2>&1 && ruff check hooks || echo "ruff not installed — skipping python lint"
-	@command -v shellcheck >/dev/null 2>&1 && shellcheck hooks/*.sh || echo "shellcheck not installed — skipping shell lint"
+	@command -v shellcheck >/dev/null 2>&1 && shellcheck hooks/*.sh git-hooks/dispatch || echo "shellcheck not installed — skipping shell lint"
 
 scan:           ## Run gitleaks secret scan (if installed)
 	@command -v gitleaks >/dev/null 2>&1 && gitleaks detect --no-banner --config .gitleaks.toml \

@@ -40,7 +40,10 @@ Counts user messages, reports token usage, detects friction and "goodbye" phrase
 
 ### 3. PreToolUse guards
 Fire **before** a tool call lands, and can block it:
-- `gitleaks_guard.sh` — scans staged changes for secrets before `git commit`.
+- `hook_bypass_guard.py` — blocks a Bash command that would skip the git
+  pre-commit secret scan (`--no-verify`, or moving `core.hooksPath`). The scan
+  itself is a git hook, `git-hooks/dispatch` (`make install-git-hooks`), so it
+  covers every commit on the machine, not only Claude's.
 - `pr_security_scan.sh` — scans the branch diff before `gh pr create`.
 - `ruff_workflow_guard.py` — runs `ruff check` before committing in CI repos.
 - `prd_guard.sh` — warns before editing prod-looking paths.

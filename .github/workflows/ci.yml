@@ -31,11 +31,24 @@ jobs:
           uv pip install 'ruff==0.17.3' pytest
           sudo apt-get update && sudo apt-get install -y shellcheck
 
+      - name: Install gitleaks (the git-hooks/dispatch tests need it)
+        run: |
+          set -e
+          VER=8.30.1
+          SHA=551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+          TGZ="gitleaks_${VER}_linux_x64.tar.gz"
+          curl -sSfL -o "$RUNNER_TEMP/$TGZ" "https://github.com/gitleaks/gitleaks/releases/download/v${VER}/${TGZ}"
+          echo "$SHA  $RUNNER_TEMP/$TGZ" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/bin"
+          tar -xzf "$RUNNER_TEMP/$TGZ" -C "$RUNNER_TEMP/bin" gitleaks
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/bin/gitleaks" version
+
       - name: Ruff lint (hooks)
         run: uv run ruff check hooks
 
       - name: Shellcheck (errors only — style nits are fine in hook scripts)
-        run: shellcheck -S error hooks/*.sh
+        run: shellcheck -S error hooks/*.sh git-hooks/dispatch
 
       - name: Hook syntax (python + bash)
         run: make syntax
