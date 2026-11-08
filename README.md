@@ -56,7 +56,7 @@ See **[docs/WORKFLOW.md](docs/WORKFLOW.md)** for the full walkthrough and the va
 | SessionStart | `session_start.py` | Init/resume session state, git context, open specs + pending work; optional checks (deployed-hook drift, live-hooks branch, untracked config, stale canary, secret-scan hook) via `config.example.sh`; output kept under the 10k hook cap |
 | SessionStart | `mcp_restore_guard.py` | Self-heal: re-register local stdio MCP servers that got dropped from `~/.claude.json` (opt-in via `mcp-restore.json`) |
 | UserPromptSubmit | `track.py`, `consume_prompt.py` | Message counting, token report, friction/goodbye detection, pending prompts |
-| PreToolUse | `gitleaks_guard.sh`, `pr_security_scan.sh` | Block commits/PRs that leak secrets |
+| PreToolUse | `gitleaks_guard.sh`, `pr_security_scan.sh` | Block commits/PRs that leak secrets (advisory: scans the current directory's repo, skips with a warning if gitleaks is missing; a git pre-commit hook is the real gate) |
 | PreToolUse | `prd_guard.sh` | Warn before editing prod-looking paths |
 | PreToolUse | `ruff_workflow_guard.py` | Ruff check before committing in CI repos |
 | (gate) | `validate_tier.py` | Pick the review tier from diff size + sensitive paths |
