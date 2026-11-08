@@ -29,6 +29,15 @@ SCRIPT = HOOKS_DIR / "validate_tier.py"
 # ---------- pure unit tests (no git required) ----------
 
 
+@pytest.fixture(autouse=True)
+def _isolated_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A developer's shell must not change what these tests see."""
+    for name in ("CRAFT_CONFIG_REPO", "CRAFT_CONFIG_SUBDIR", "GIT_DIR",
+                 "GIT_WORK_TREE", "GIT_INDEX_FILE"):
+        monkeypatch.delenv(name, raising=False)
+
+
+
 class TestRecommendTier:
     def test_empty_diff_is_skip(self) -> None:
         result = vt.recommend_tier(files=[], added={}, loc=0)
@@ -377,12 +386,10 @@ class TestRecommendTier:
     @pytest.mark.parametrize(
         "path",
         [
-            "hooks/session_start.py",
-            "tests/test_session_start.py",
-            "tests/test_session_start_hook_drift.py",
-            "tests/test_session_start_budget.py",
             ".claude/hooks/session_start.py",
             ".claude/hooks/tests/test_session_start.py",
+            # a test file added later needs no edit here
+            ".claude/hooks/tests/test_session_start_some_new_check.py",
         ],
     )
     def test_harness_session_start_hook_does_not_escalate(self, path: str) -> None:
@@ -420,9 +427,11 @@ class TestRecommendTier:
     def test_session_start_suffix_does_not_smuggle_other_patterns(
         self, path: str, pattern: str
     ) -> None:
-        # An exempt path skips every sensitive pattern, so the exemption must
-        # name exact files rather than accept any suffix.
-        result = vt.recommend_tier(files=[path], added={path: ["x = 1"]}, loc=1)
+        # The exemption covers the `session` pattern only, so a suffix naming
+        # another sensitive word still escalates on that word.
+        result = vt.recommend_tier(
+            files=[path], added={path: ["x = 1"]}, loc=1, config_repo=True
+        )
         assert result["tier"] == "Full"
         assert pattern in result["sensitive_patterns"]
 
@@ -444,6 +453,185 @@ class TestRecommendTier:
         # The hook holds the psql_env DSN split; editing that plumbing must keep
         # its Full gate even though the filename is exempt.
         path = "hooks/session_start.py"
+        result = vt.recommend_tier(
+            files=[path],
+            added={path: added},
+            loc=1,
+            deleted={path: deleted},
+            config_repo=True,
+        )
+        assert result["tier"] == "Full"
+        assert result["sensitive_patterns"] == ["credential-content"]
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            # this kit's layout: hooks/ and tests/ at the repo root
+            "hooks/session_start.py",
+            "tests/test_session_start.py",
+            "tests/test_session_start_db_checks.py",
+            "tests/test_session_start_live_hooks.py",
+            # a test file added later needs no edit here
+            "tests/test_session_start_some_new_check.py",
+        ],
+    )
+    def test_config_repo_session_start_hook_does_not_escalate(self, path: str) -> None:
+        result = vt.recommend_tier(
+            files=[path], added={path: ["x = 1"]}, loc=1, config_repo=True
+        )
+        assert result["tier"] == "Light"
+        assert "session" not in result["sensitive_patterns"]
+
+    @pytest.mark.parametrize(
+        "path", ["hooks/session_start.py", "tests/test_session_start.py"]
+    )
+    def test_root_layout_escalates_outside_a_config_repo(self, path: str) -> None:
+        # `hooks/` and `tests/` are generic: a web app's login-session code
+        # there must keep its Full gate.
+        result = vt.recommend_tier(files=[path], added={path: ["x = 1"]}, loc=1)
+        assert result["tier"] == "Full"
+        assert "session" in result["sensitive_patterns"]
+
+    @pytest.mark.parametrize(
+        ("path", "pattern"),
+        [
+            # the secret-scan test stays Full on `secret`
+            ("tests/test_session_start_secret_scan.py", "secret"),
+            ("tests/test_session_start_token.py", "token"),
+            ("hooks/test_session_start.py", "session"),
+            # root-anchored: a nested hooks/ dir is not the config repo's
+            ("app/hooks/session_start.py", "session"),
+            ("src/tests/test_session_start.py", "session"),
+        ],
+    )
+    def test_config_repo_near_miss_still_escalates(self, path: str, pattern: str) -> None:
+        result = vt.recommend_tier(
+            files=[path], added={path: ["x = 1"]}, loc=1, config_repo=True
+        )
+        assert result["tier"] == "Full"
+        assert pattern in result["sensitive_patterns"]
+
+    @pytest.mark.parametrize(
+        ("subdir", "path", "exempt"),
+        [
+            ("claude-config", "claude-config/hooks/session_start.py", True),
+            ("claude-config/", "claude-config/tests/test_session_start.py", True),
+            # tests kept at the checkout root still match
+            ("claude-config", "tests/test_session_start.py", True),
+            # memory-persistor's layout: tests under <subdir>/hooks/tests/
+            ("claude-config", "claude-config/hooks/tests/test_session_start_budget.py", True),
+            ("claude-config", "other/hooks/session_start.py", False),
+            ("", "claude-config/hooks/session_start.py", False),
+        ],
+    )
+    def test_config_subdir_layout(
+        self, monkeypatch: pytest.MonkeyPatch, subdir: str, path: str, exempt: bool
+    ) -> None:
+        monkeypatch.setenv("CRAFT_CONFIG_SUBDIR", subdir)
+        assert vt.is_session_start_hook(path, config_repo=True) is exempt
+        assert vt.is_session_start_hook(path, config_repo=False) is False
+
+    @pytest.mark.parametrize(
+        ("url", "name"),
+        [
+            ("https://github.com/effecet/claude-craft-kit.git", "claude-craft-kit"),
+            ("https://github.com/effecet/claude-craft-kit/", "claude-craft-kit"),
+            ("git@github.com:effecet/claude-craft-kit.git", "claude-craft-kit"),
+            ("git@host:claude-craft-kit.git", "claude-craft-kit"),
+            ("ssh://example/owner/dotfiles.git\n", "dotfiles"),
+            ("", None),
+        ],
+    )
+    def test_repo_from_url(self, url: str, name: str | None) -> None:
+        assert vt.repo_from_url(url) == name
+
+    @pytest.mark.parametrize(
+        ("added", "deleted"),
+        [
+            # a helper added to an import line that already named a credential one
+            (
+                ["from common import home_memory_dir, resolve_connection_string"],
+                ["from common import resolve_connection_string"],
+            ),
+            (["import os, psql_env"], ["import psql_env, os"]),
+            (
+                ["from common import (resolve_connection_string, home_memory_dir)"],
+                ["from common import resolve_connection_string"],
+            ),
+        ],
+    )
+    def test_edited_import_keeping_same_credential_name_does_not_escalate(
+        self, added: list[str], deleted: list[str]
+    ) -> None:
+        path = ".claude/hooks/session_start.py"
+        result = vt.recommend_tier(
+            files=[path], added={path: added}, loc=1, deleted={path: deleted}
+        )
+        assert result["tier"] == "Light"
+        assert result["sensitive_patterns"] == []
+
+    @pytest.mark.parametrize(
+        ("added", "deleted"),
+        [
+            # a credential name newly imported
+            (
+                ["from common import resolve_connection_string, psql_env"],
+                ["from common import resolve_connection_string"],
+            ),
+            # a credential name dropped from the import
+            (
+                ["from common import home_memory_dir"],
+                ["from common import home_memory_dir, resolve_connection_string"],
+            ),
+            # removal only
+            ([], ["from common import psql_env"]),
+            # same keyword, different module / name / alias
+            (["from shim import psql_env"], ["from common import psql_env"]),
+            (["from common import psql_connect"], ["from common import psql_env"]),
+            (["from common import revoke_token"], ["from common import get_token"]),
+            (["import psql_env_raw"], ["import psql_env"]),
+            (["import PSQL_env"], ["import psql_env"]),
+            (["from common import psql_env as pe"], ["from common import psql_env as pg"]),
+            # the credential word is only in the module
+            (["from random import choice"], ["from secrets import choice"]),
+            (["from evil_helpers import connect"], ["from psql_helpers import connect"]),
+            (["from psql_helpers import run"], []),
+            (["from common.dsn import build"], []),
+            # a star import can shadow any credential helper
+            (["from evil import *"], []),
+            # a moved `;` line (identical on both sides) is still scanned
+            (
+                ["import os; os.environ['PGPASSWORD'] = 'x'"],
+                ["import os; os.environ['PGPASSWORD'] = 'x'"],
+            ),
+            (
+                ["from common import resolve_connection_string_unsafe as resolve_connection_string"],
+                ["from common import resolve_connection_string"],
+            ),
+            # a `;` line is not an import: the statement after it is scanned
+            (
+                ["import os; os.environ['PGPASSWORD'] = 'y'"],
+                ["import os; os.environ['PGPASSWORD'] = 'x'"],
+            ),
+            # a parenthesised multi-line import is scanned like any line
+            (
+                ["from common import (", "    resolve_connection_string,", ")"],
+                ["from common import resolve_connection_string"],
+            ),
+            # an unchanged import does not launder a credential edit elsewhere
+            (
+                [
+                    "from common import home_memory_dir, resolve_connection_string",
+                    "    argv_dsn, env = psql_env(conn)",
+                ],
+                ["from common import resolve_connection_string"],
+            ),
+        ],
+    )
+    def test_import_credential_change_still_escalates(
+        self, added: list[str], deleted: list[str]
+    ) -> None:
+        path = ".claude/hooks/session_start.py"
         result = vt.recommend_tier(
             files=[path], added={path: added}, loc=1, deleted={path: deleted}
         )
@@ -746,3 +934,67 @@ class TestEndToEnd:
         assert data["tier"] == "Light"
         assert data["loc"] == 2
         assert data["files"] == 1
+
+
+class TestIsConfigRepo:
+    """The root session_start layout is exempt only in a config repo."""
+
+    @staticmethod
+    def _stage_hook(repo: Path) -> None:
+        (repo / "hooks").mkdir()
+        (repo / "hooks" / "session_start.py").write_text("x = 1\n")
+        subprocess.run(["git", "add", "hooks"], cwd=repo, check=True)
+
+    def test_outside_git_is_false(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("CRAFT_CONFIG_REPO", str(tmp_path))
+        assert vt.is_config_repo() is False
+
+    def test_plain_repo_is_false(self, git_repo, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("CRAFT_CONFIG_REPO", raising=False)
+        assert vt.is_config_repo() is False
+
+    def test_kit_origin_is_true(self, git_repo, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("CRAFT_CONFIG_REPO", raising=False)
+        subprocess.run(
+            ["git", "remote", "add", "origin", "https://github.com/x/claude-craft-kit.git"],
+            check=True,
+        )
+        assert vt.is_config_repo() is True
+
+    def test_configured_checkout_is_true(
+        self, git_repo, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        repo, _ = git_repo
+        (repo / "sub").mkdir()
+        monkeypatch.chdir(repo / "sub")  # the toplevel is compared, not the cwd
+        monkeypatch.setenv("CRAFT_CONFIG_REPO", str(repo))
+        assert vt.is_config_repo() is True
+
+    def test_other_configured_checkout_is_false(
+        self, git_repo, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("CRAFT_CONFIG_REPO", str(tmp_path / "elsewhere"))
+        assert vt.is_config_repo() is False
+
+    def test_end_to_end_root_hook_full_in_plain_repo(
+        self, git_repo, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        repo, run = git_repo
+        monkeypatch.delenv("CRAFT_CONFIG_REPO", raising=False)
+        self._stage_hook(repo)
+        data = json.loads(run("--staged", "--json").stdout)
+        assert data["tier"] == "Full"
+        assert "session" in data["sensitive_patterns"]
+
+    def test_end_to_end_root_hook_light_in_config_repo(
+        self, git_repo, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        repo, run = git_repo
+        monkeypatch.setenv("CRAFT_CONFIG_REPO", str(repo))
+        self._stage_hook(repo)
+        data = json.loads(run("--staged", "--json").stdout)
+        assert data["tier"] == "Light"
+        assert data["sensitive_patterns"] == []

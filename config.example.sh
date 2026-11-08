@@ -19,6 +19,18 @@ export PYTHON_BIN="python3"
 #   Windows : PowerShell + BurntToast (Install-Module BurntToast)
 # Nothing to set here — install the tool for your OS, or ignore for terminal-only.
 
+# ---- Token report (optional) ------------------------------------------------
+# track.py prints hooks/token_tracker.py's summary every few messages. Its cost
+# line is an estimate at ONE flat price set for every model: set your model's
+# prices in USD per million tokens. Its Context bar is rough too: tokens summed
+# over the whole transcript, not the live context. Unset or invalid (not a
+# finite positive number; the window must be greater than 1) = the defaults shown.
+# export CRAFT_PRICE_INPUT_PER_M="15.00"
+# export CRAFT_PRICE_OUTPUT_PER_M="75.00"
+# export CRAFT_PRICE_CACHE_WRITE_PER_M="18.75"
+# export CRAFT_PRICE_CACHE_READ_PER_M="1.50"
+# export CRAFT_CONTEXT_WINDOW="1000000"
+
 # ---- Optional memory backend (OFF by default) -------------------------------
 # The brain-coupled hooks (proactive_recall, backup_hook, and the brain steps
 # in session_start/track) stay dormant unless you opt in here. Wiring guide:
@@ -51,6 +63,11 @@ export BACKUP_BRANCH="main"
 # ~/.claude/hooks and ~/.claude/scripts with the git checkout they come from, and say which copies are AHEAD (local forks —
 # upstream them before copying), stale, or diverged.
 # export CRAFT_CONFIG_REPO="${HOME}/code/claude-craft-kit"
+# It also tells validate_tier.py which checkout is your config repo: there,
+# the root hooks/session_start.py and tests/test_session_start*.py skip the
+# `session` sensitive pattern (other patterns and the credential check still
+# apply). Elsewhere those generic paths stay Full. This kit's own clone counts
+# without it.
 # Subdirectory of that checkout holding hooks/ and scripts/ (unset = root):
 # export CRAFT_CONFIG_SUBDIR=""
 # Basenames you keep as deliberate per-machine forks (comma-separated):

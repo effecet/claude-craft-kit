@@ -31,7 +31,8 @@ from common import encode_project_path
 CLAUDE_DIR = Path(os.environ.get("CLAUDE_DIR", str(Path.home() / ".claude")))
 STATE_FILE = CLAUDE_DIR / "session/state.json"
 FRICTION_LOG = CLAUDE_DIR / "session/friction.jsonl"
-TOKEN_TRACKER = CLAUDE_DIR / "token_tracker.py"
+# Runs from track.py's own directory: `make install` copies hooks/ as a unit.
+TOKEN_TRACKER = Path(__file__).resolve().parent / "token_tracker.py"
 BACKUP_SCRIPT = CLAUDE_DIR / "hooks/backup_hook.py"
 PYTHON_VENV = Path.home() / ".venv/bin/python"
 
@@ -214,11 +215,12 @@ def _archive_and_reset_if_day_changed(state: dict) -> dict:
 
 
 def run_token_report(transcript_path: str) -> None:
-    # Guard: token_tracker.py is an optional sibling. Degrade gracefully if absent.
+    # Guard: an install that copied track.py alone has no token_tracker.py.
     if not TOKEN_TRACKER.exists():
         return
     try:
-        subprocess.run(["python3", str(TOKEN_TRACKER), transcript_path], timeout=10)
+        # This interpreter, not a bare `python3`: the tracker needs 3.11+.
+        subprocess.run([sys.executable, str(TOKEN_TRACKER), transcript_path], timeout=10)
     except Exception as e:
         print(f"[track] Token report error: {e}", file=sys.stderr)
 
@@ -332,15 +334,19 @@ def _resolve_transcript(hook_data: dict, state: dict) -> str:
     return tp
 
 
-def _step_token_report(count: int, transcript_path: str) -> None:
-    """Print token summary every TOKEN_REPORT_INTERVAL messages."""
+def _step_token_report(count: int, transcript_path: str) -> bool:
+    """Print token summary every TOKEN_REPORT_INTERVAL messages.
+
+    True when token_tracker ran (and so may have written "tokens")."""
     if count % TOKEN_REPORT_INTERVAL != 0:
-        return
-    if transcript_path:
+        return False
+    ran = bool(transcript_path)
+    if ran:
         run_token_report(transcript_path)
     else:
         print(f"[i] Session checkpoint: {count} messages")
     _desktop_notify("Claude Code", f"Session checkpoint: {count} messages")
+    return ran
 
 
 def _step_backup(count: int) -> None:
@@ -483,7 +489,12 @@ def main() -> None:
 
     user_prompt = hook_data.get("prompt", "")
 
-    _step_token_report(count, transcript_path)
+    # token_tracker writes "tokens" to the state file itself; keep that write
+    # instead of overwriting it with this run's older copy below. Only after it
+    # ran: on other turns the file can still hold yesterday's state, whose
+    # tokens a day reset just dropped.
+    if _step_token_report(count, transcript_path) and "tokens" in (fresh := read_state()):
+        state["tokens"] = fresh["tokens"]
     _step_backup(count)
     _step_staleness(count, state)
     _step_threshold_prompt(count, state)

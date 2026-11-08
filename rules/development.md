@@ -216,9 +216,15 @@ The script accepts any git ref (`HEAD`, `main`, a commit sha) or the `--staged` 
 Any diff touching these patterns triggers Full tier — config included. The one
 exception is prose (`.md`/`.rst`/`.adoc`): a doc's name is never a signal, so
 `docs/security.md` neither escalates a diff nor stops a docs-only one Skipping.
-A short list of named, tested false positives (harness session state, the
-SessionStart hook, calendar `*-session.*` files) is exempt — see
+A short list of named, tested false positives (harness session state,
+calendar `*-session.*` files) is exempt — see
 `validate_tier.py:SENSITIVE_EXEMPT_PATHS`; the script is the source of truth.
+The SessionStart hook and its tests skip only the `session` pattern
+(`is_session_start_hook`): a deployed `.claude/hooks/` copy anywhere, and the
+root `hooks/` + `tests/` layout only in your config repo (this kit, or
+`CRAFT_CONFIG_REPO`). A changed line touching credential plumbing still goes
+Full; an import line counts only if a (module, name, alias) with any
+credential-shaped part, or a star import, changes.
 - `auth`, `login`, `session`, `token`, `password`
 - `payment`, `stripe`, `billing`
 - `migration`, `schema`, `ALTER`
