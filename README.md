@@ -127,6 +127,7 @@ claude-craft-kit/
 │   ├── session_start.py        # SessionStart: state, git context, specs
 │   ├── mcp_restore_guard.py    # SessionStart: self-heal missing local MCP servers
 │   ├── track.py                # UserPromptSubmit: counting, tokens, friction
+│   ├── token_tracker.py        # token + estimated-cost report track.py prints
 │   ├── consume_prompt.py       # UserPromptSubmit: surface pending prompts
 │   ├── validate_tier.py        # the tiered validation gate
 │   ├── stop_gate.py            # Stop: wrap-up exit gate

@@ -22,10 +22,12 @@ Exit codes:
 """
 
 import json
+import os
 import re
-from pathlib import Path
 import subprocess
 import sys
+from collections import Counter
+from pathlib import Path
 
 # Sensitive path keywords from rules/development.md — auto-escalate to Full tier.
 # Common words (auth, session, schema, migration, etc.) are anchored by segment
@@ -89,21 +91,61 @@ SENSITIVE_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
 
 # The harness's SessionStart lifecycle hook and its tests: `_` is a segment
 # boundary, so `session` matched the filename and every edit to one of the
-# most-edited hooks cost a 6-agent Full gate. Anchored to the hooks dir
-# itself (this kit's root `hooks/`, or a `.claude/hooks/`) — `src/session_start.py`
-# still escalates. The
-# names are listed, not wildcarded: an exempt path skips EVERY pattern, so
-# `session_start_token.py` must not ride along. A new name escalates.
-_SESSION_START_HOOK = re.compile(
-    r"(^(hooks/session_start|tests/test_session_start(_hook_drift|_budget|_canary_liveness|_config_untracked|_live_hooks|_secret_scan)?)"
-    r"|(^|/)\.claude/hooks/(session_start|tests/test_session_start(_hook_drift|_budget|_canary_liveness|_config_untracked|_live_hooks|_secret_scan)?))\.py$"
+# most-edited hooks cost a 6-agent Full gate. These paths skip the `session`
+# pattern ONLY and are still checked against every other, so any test suffix
+# may ride along: `test_session_start_token.py` still escalates on `token`,
+# `test_session_start_secret_scan.py` on `secret`.
+#
+# A deployed `.claude/hooks/` applies in any repo. This kit keeps the hook at
+# the repo ROOT (`hooks/`, `tests/`), and those are generic names, so the root
+# layout applies only in a config repo (is_config_repo): this kit, or the
+# checkout CRAFT_CONFIG_REPO names, under CRAFT_CONFIG_SUBDIR when that is set.
+# `src/session_start.py` and a nested `app/hooks/session_start.py` always
+# escalate.
+_DOT_CLAUDE_SESSION_START_HOOK = re.compile(
+    r"(^|/)\.claude/hooks/(session_start|tests/test_session_start(_\w+)?)\.py$"
 )
+_ROOT_SESSION_START_HOOK = re.compile(
+    r"^(hooks/session_start|(hooks/)?tests/test_session_start(_\w+)?)\.py$"
+)
+KIT_REPO = "claude-craft-kit"
 
-# Exempt paths whose CONTENT still escalates. session_start.py really does hold
-# credential plumbing (the optional memory backend's DSN handling), so the `session` filename hit was
-# accidentally right for it: a changed line — added OR deleted — that touches
-# that plumbing reports `credential-content` and goes Full.
-CONTENT_GUARDED_EXEMPT_PATHS: list[re.Pattern[str]] = [_SESSION_START_HOOK]
+
+def is_session_start_hook(path: str, config_repo: bool = False) -> bool:
+    """True for the SessionStart hook or one of its tests.
+
+    The root layout counts only when `config_repo` is true (is_config_repo())."""
+    if _DOT_CLAUDE_SESSION_START_HOOK.search(path):
+        return True
+    return config_repo and _is_root_session_start_hook(path)
+
+
+def _is_root_session_start_hook(path: str) -> bool:
+    """The root layout, tests under `tests/` or `hooks/tests/`.
+
+    With CRAFT_CONFIG_SUBDIR set, both `<subdir>/...` and the checkout root
+    count (tests often stay at the root)."""
+    subdir = os.environ.get("CRAFT_CONFIG_SUBDIR", "").strip("/")
+    if subdir and path.startswith(f"{subdir}/"):
+        path = path[len(subdir) + 1 :]
+    return bool(_ROOT_SESSION_START_HOOK.search(path))
+
+
+# The session_start paths are also content-guarded. The hook really does hold
+# credential plumbing (the optional memory backend's DSN handling), and its
+# tests exercise it, so a changed line — added OR deleted — that touches that
+# plumbing reports `credential-content` and goes Full.
+#
+# Except an import line that only gains or loses NON-credential names
+# (`from common import resolve_connection_string` gaining `home_memory_dir`):
+# the scan would match the helper's NAME, not plumbing. Import lines are
+# compared as (module, name, alias) triples, keeping those where any of the
+# three is credential-shaped, plus star imports: a different module, name or
+# alias counts. A line with `;` is never treated as an import, and a
+# parenthesised multi-line import is scanned like any other line (both fail
+# toward Full).
+_IMPORT_LINE_RE = re.compile(r"^\s*(?:from\s+(\S+)\s+)?import\s+([^;]*)$")
+_IMPORT_ITEM_RE = re.compile(r"^([\w.]+)(?:\s+as\s+(\w+))?$")
 CREDENTIAL_CONTENT_RE = re.compile(
     r"psql|dsn|database_url|pgpassword|password|secret|token|credential|\.env\b"
     r"|connection_string|\bconn\b|\benv\s*=",
@@ -122,7 +164,6 @@ SENSITIVE_EXEMPT_PATHS: list[re.Pattern[str]] = [
     # handler (schedule-session.js) once auto-escalated a 6-LOC CSS-class
     # rename to Full tier.
     re.compile(r"(^|/)(schedule|booking|calendar)-session\.[a-z]+$"),
-    _SESSION_START_HOOK,  # content-guarded — see CONTENT_GUARDED_EXEMPT_PATHS
 ]
 
 # Forbidden code markers — block before any gate runs
@@ -565,30 +606,64 @@ def ci_workflow_hits(
     return []
 
 
-def matched_sensitive_paths(files: list[str]) -> list[str]:
+def matched_sensitive_paths(files: list[str], config_repo: bool = False) -> list[str]:
     """Return the unique set of sensitive pattern NAMES that matched any file path."""
     hits: set[str] = set()
     for f in files:
         if any(p.search(f) for p in SENSITIVE_EXEMPT_PATHS):
             continue
+        session_start = is_session_start_hook(f, config_repo)
         for name, pattern in SENSITIVE_PATTERNS:
-            if pattern.search(f):
+            if pattern.search(f) and not (session_start and name == "session"):
                 hits.add(name)
     return sorted(hits)
 
 
 def credential_content_hits(
-    files: list[str], added: dict[str, list[str]], deleted: dict[str, list[str]]
+    files: list[str],
+    added: dict[str, list[str]],
+    deleted: dict[str, list[str]],
+    config_repo: bool = False,
 ) -> list[str]:
-    """Return ["credential-content"] if a content-guarded exempt file changes a
-    line touching credential plumbing — added or deleted, since removing a
+    """Return ["credential-content"] if a session_start file changes a line
+    touching credential plumbing — added or deleted, since removing a
     credential-handling call is the regression this exists to catch."""
     for f in files:
-        if not any(p.search(f) for p in CONTENT_GUARDED_EXEMPT_PATHS):
+        if not is_session_start_hook(f, config_repo):
             continue
-        if any(CREDENTIAL_CONTENT_RE.search(ln) for ln in added.get(f, []) + deleted.get(f, [])):
+        added_lines, deleted_lines = added.get(f, []), deleted.get(f, [])
+        touches_plumbing = any(
+            CREDENTIAL_CONTENT_RE.search(ln)
+            for ln in added_lines + deleted_lines
+            if not _IMPORT_LINE_RE.match(ln)
+        )
+        imports_changed = _credential_imports(added_lines) != _credential_imports(deleted_lines)
+        if touches_plumbing or imports_changed:
             return ["credential-content"]
     return []
+
+
+def _credential_imports(lines: list[str]) -> Counter[tuple[str, str, str]]:
+    """(module, name, alias) for each import item whose module, name or alias
+    is credential-shaped, plus every star import.
+
+    An item the parser cannot read counts as credential-shaped when its raw
+    text is, so it can only push toward Full."""
+    found: Counter[tuple[str, str, str]] = Counter()
+    for ln in lines:
+        m = _IMPORT_LINE_RE.match(ln)
+        if not m:
+            continue
+        module = m.group(1) or ""
+        for raw in m.group(2).strip().strip("()").split(","):
+            item = raw.strip()
+            parsed = _IMPORT_ITEM_RE.match(item)
+            name, alias = (parsed.group(1), parsed.group(2) or "") if parsed else (item, "")
+            # The module counts too (`from secrets import choice`), and a star
+            # import can shadow any credential helper.
+            if name == "*" or CREDENTIAL_CONTENT_RE.search(f"{module} {name} {alias}"):
+                found[(module, name, alias)] += 1
+    return found
 
 
 def find_forbidden_markers(added: dict[str, list[str]]) -> list[str]:
@@ -632,12 +707,14 @@ def recommend_tier(
     added: dict[str, list[str]],
     loc: int,
     deleted: dict[str, list[str]] | None = None,
+    config_repo: bool = False,
 ) -> dict:
     """Decide tier. Marker BLOCK > sensitive (incl. CI workflow permissions/
     secrets) Full > docs/config Skip > build-tooling Light (a cap) >
     zero-effective-LOC Light-if-floor-else-Skip > LOC threshold.
 
     Sensitivity is judged on non-prose paths only (see PROSE_RE).
+    `config_repo` (is_config_repo()) enables the root session_start layout.
 
     Return schema is stable across all tiers — `markers` and `sensitive_patterns`
     are always present (possibly empty lists), so JSON consumers can rely on a
@@ -660,8 +737,10 @@ def recommend_tier(
 
     # Before the config/docs Skip, so config/secrets.yaml cannot Skip; over
     # non-prose paths, so docs/security.md never escalates.
-    sensitive = matched_sensitive_paths([f for f in files if not PROSE_RE.search(f)])
-    sensitive += credential_content_hits(files, added, deleted or {})
+    sensitive = matched_sensitive_paths(
+        [f for f in files if not PROSE_RE.search(f)], config_repo
+    )
+    sensitive += credential_content_hits(files, added, deleted or {}, config_repo)
     sensitive += ci_workflow_hits(files, added, deleted or {})
     if sensitive:
         return {
@@ -741,6 +820,36 @@ def print_human(result: dict) -> None:
         print(f"   Sensitive: {', '.join(result['sensitive_patterns'])}")
 
 
+def repo_from_url(url: str) -> str | None:
+    """Repo name from a remote URL (https, ssh or scp form), else None."""
+    name = url.strip().rstrip("/").rsplit("/", 1)[-1].rsplit(":", 1)[-1]
+    name = name.removesuffix(".git")
+    return name or None
+
+
+def _git(*args: str) -> str | None:
+    try:
+        proc = subprocess.run(
+            ["git", *args], capture_output=True, text=True, timeout=10
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return proc.stdout.strip() if proc.returncode == 0 else None
+
+
+def is_config_repo() -> bool:
+    """True in this kit's own checkout (origin named KIT_REPO) or in the
+    checkout CRAFT_CONFIG_REPO names; False outside git."""
+    url = _git("remote", "get-url", "origin")
+    if url and repo_from_url(url) == KIT_REPO:
+        return True
+    configured = os.environ.get("CRAFT_CONFIG_REPO")
+    toplevel = _git("rev-parse", "--show-toplevel")
+    if not (configured and toplevel):
+        return False
+    return Path(os.path.expanduser(configured)).resolve() == Path(toplevel).resolve()
+
+
 def main() -> None:
     args = [a for a in sys.argv[1:] if a != "--json"]
     json_mode = "--json" in sys.argv
@@ -748,7 +857,9 @@ def main() -> None:
 
     files, added, raw_loc, deleted = get_diff(scope)
     breakdown = loc_breakdown(added, raw_loc, deleted)
-    result = recommend_tier(files, added, breakdown["effective"], deleted)
+    # is_config_repo() costs two git calls, and only the root layout reads it.
+    config_repo = any(map(_is_root_session_start_hook, files)) and is_config_repo()
+    result = recommend_tier(files, added, breakdown["effective"], deleted, config_repo)
     result["raw_loc"] = raw_loc
     result["loc_breakdown"] = breakdown
 
