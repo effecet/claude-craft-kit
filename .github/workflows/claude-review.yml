@@ -53,7 +53,12 @@ jobs:
       - if: steps.token.outputs.present == 'true'
         uses: actions/checkout@v7
         with:
-          fetch-depth: 1
+          # The pull_request checkout is the PR merged into its base. At depth 1
+          # that lone commit looks like an "initial add" of every file, and the
+          # review once covered the whole repo instead of the change. Depth 2
+          # keeps both parents so it no longer looks that way. The reviewer
+          # cannot run git, so the prompt's `gh pr diff` is the actual scope.
+          fetch-depth: 2
           persist-credentials: false
       - if: steps.token.outputs.present == 'true'
         uses: anthropics/claude-code-action@4845bacbb38b3c4b15d948f035349786f678e068 # v1
@@ -65,7 +70,13 @@ jobs:
             PR NUMBER: ${{ github.event.pull_request.number }}
             HEAD SHA: ${{ github.event.pull_request.head.sha }}
 
-            Review this pull request. The PR branch is checked out in the working directory.
+            Review this pull request. The PR merged into its base is checked out in the
+            working directory. Review ONLY what the PR changes: run
+            `gh pr diff ${{ github.event.pull_request.number }}` before anything else; that
+            diff is the scope. Read other files only for context. If `gh pr diff` fails
+            (GitHub refuses very large diffs), use
+            `gh pr view ${{ github.event.pull_request.number }} --json files` as the scope
+            and say in the summary that the full diff was unavailable.
             Focus, in order: correctness bugs, security (secrets, hostnames, personal paths,
             injection), contract or behaviour changes not reflected in README/diagrams, then
             test gaps. Skip style nits a linter would catch. If nothing is wrong, say so briefly.
