@@ -44,13 +44,13 @@ jobs:
           echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
           "$RUNNER_TEMP/bin/gitleaks" version
 
-      - name: Ruff lint (hooks)
-        run: uv run ruff check hooks
+      - name: Ruff lint (hooks, tools)
+        run: uv run ruff check hooks tools
 
       - name: Shellcheck (errors only — style nits are fine in hook scripts)
         run: shellcheck -S error hooks/*.sh git-hooks/dispatch
 
-      - name: Hook syntax (python + bash)
+      - name: Syntax (hooks, tools)
         run: make syntax
 
       - name: Validate JSON files

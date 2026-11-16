@@ -71,6 +71,12 @@ validation gate + TDD), `operations.md` (proposal gate, git safety), `memory.md`
 `project-hygiene.md`, `context7.md`, `data-engineering.md`, `typescript.md`,
 `supabase.md`, `tooling.md`, `npm-cache-eperm.md`.
 
+**Tools** (`tools/`) — `mutcheck.py` runs hand-written mutants against a scoped
+pytest selection in a private `git archive` copy, so mutation testing never
+touches your working tree. Needs Python 3.11+ (the hooks need 3.10+).
+Installed into `~/.claude/tools/`; see
+[docs/mutcheck.md](docs/mutcheck.md).
+
 **Commands** (`commands/`) — slash commands installed into `~/.claude/commands/`:
 `/clear-pending` reviews the open pending queue and resolves what's already done
 (batched behind the proposal gate — nothing is resolved without approval).
@@ -148,7 +154,8 @@ claude-craft-kit/
 │   ├── dispatch                # global git hook: gitleaks on pre-commit, then the repo's own hook
 │   └── pre-commit, …           # one symlink to dispatch per safe git hook name
 ├── docs/
-│   └── WORKFLOW.md             # the full lifecycle + validation-tier rules
+│   ├── WORKFLOW.md             # the full lifecycle + validation-tier rules
+│   └── mutcheck.md             # mutcheck usage, verdicts, limits
 ├── hooks/
 │   ├── session_start.py        # SessionStart: state, git context, specs
 │   ├── mcp_restore_guard.py    # SessionStart: self-heal missing local MCP servers
@@ -172,7 +179,9 @@ claude-craft-kit/
 ├── commands/
 │   └── clear-pending.md        # /clear-pending — triage the pending work queue
 ├── rules/                      # the 10 behavior rules
-└── tests/                      # hook unit tests (pytest)
+├── tools/
+│   └── mutcheck.py             # safe mutation-check runner for pytest suites
+└── tests/                      # hook + tool tests (pytest)
 ```
 
 ## License

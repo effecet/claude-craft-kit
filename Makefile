@@ -8,12 +8,13 @@ help:           ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | \
 		awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'
 
-install:        ## Copy hooks/ + rules/ + commands/ + CLAUDE.example.md into CLAUDE_DIR (default ~/.claude)
+install:        ## Copy hooks/ + rules/ + commands/ + tools/ + CLAUDE.example.md into CLAUDE_DIR (default ~/.claude)
 	@echo "Installing into $(CLAUDE_DIR) ..."
-	@mkdir -p "$(CLAUDE_DIR)/hooks" "$(CLAUDE_DIR)/rules" "$(CLAUDE_DIR)/commands"
+	@mkdir -p "$(CLAUDE_DIR)/hooks" "$(CLAUDE_DIR)/rules" "$(CLAUDE_DIR)/commands" "$(CLAUDE_DIR)/tools"
 	@cp -r hooks/. "$(CLAUDE_DIR)/hooks/"
 	@cp -r rules/. "$(CLAUDE_DIR)/rules/"
 	@cp -r commands/. "$(CLAUDE_DIR)/commands/"
+	@cp tools/mutcheck.py "$(CLAUDE_DIR)/tools/"
 	@cp CLAUDE.example.md "$(CLAUDE_DIR)/CLAUDE.example.md"
 	@echo "Done. Next steps:"
 	@echo "  1. cp config.example.sh \"$(CLAUDE_DIR)/config.local.sh\" and source it"
@@ -37,19 +38,19 @@ install-git-hooks: ## Scan every commit for secrets: copy git-hooks/ to CLAUDE_D
 	@command -v gitleaks >/dev/null 2>&1 || echo "⚠️  gitleaks not on PATH: commits will warn and go through UNSCANNED until you install it"
 	@echo "  A repo with a LOCAL core.hooksPath bypasses it; give that repo a pre-commit running: exec \"$(GIT_HOOKS_DIR)/pre-commit\" \"\$$@\""
 
-syntax:         ## Syntax-check every hook (python + bash), no bytecode written
+syntax:         ## Syntax-check hooks + tools (python + bash), no bytecode written
 	@fail=0; \
-	for f in $$(find hooks -name '*.py'); do \
+	for f in $$(find hooks tools -name '*.py'); do \
 	  python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" "$$f" \
 	    && echo "  ok  $$f" || { echo "  FAIL $$f"; fail=1; }; \
 	done; \
 	for f in $$(find hooks -name '*.sh') git-hooks/dispatch; do \
 	  bash -n "$$f" && echo "  ok  $$f" || { echo "  FAIL $$f"; fail=1; }; \
 	done; \
-	[ $$fail -eq 0 ] && echo "All hooks OK" || exit 1
+	[ $$fail -eq 0 ] && echo "All hooks + tools OK" || exit 1
 
-lint:           ## Lint hooks (ruff for python, shellcheck for bash) if installed
-	@command -v ruff >/dev/null 2>&1 && ruff check hooks || echo "ruff not installed — skipping python lint"
+lint:           ## Lint hooks + tools (ruff for python, shellcheck for bash) if installed
+	@command -v ruff >/dev/null 2>&1 && ruff check hooks tools || echo "ruff not installed — skipping python lint"
 	@command -v shellcheck >/dev/null 2>&1 && shellcheck hooks/*.sh git-hooks/dispatch || echo "shellcheck not installed — skipping shell lint"
 
 scan:           ## Run gitleaks secret scan (if installed)
