@@ -28,7 +28,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import NamedTuple, cast
 
-from _state import make_fresh_state
+from _state import make_fresh_state, write_state_atomic
 from common import resolve_connection_string
 
 CLAUDE_DIR = Path(os.environ.get("CLAUDE_DIR", str(Path.home() / ".claude")))
@@ -267,9 +267,7 @@ def init_state() -> tuple[dict, bool]:
 
 
 def write_state(state: dict) -> None:
-    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f, indent=2)
+    write_state_atomic(STATE_FILE, state)
 
 
 # ── Git context ───────────────────────────────────────────────────────────────

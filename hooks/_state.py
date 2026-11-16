@@ -1,11 +1,33 @@
 """Shared state schema for session hooks.
 
-Single source of truth for the state.json shape. Used by session_start.py
-(new sessions) and track.py (midnight rollover). Adding a new field here
-automatically propagates to both callers.
+Single source of truth for the state.json shape (make_fresh_state, used by
+session_start.py for new sessions and track.py for the midnight rollover) and
+for how hooks write it (write_state_atomic, used by every hook that writes it).
 """
 
+import json
+import os
 from datetime import UTC, datetime
+from pathlib import Path
+
+
+def write_state_atomic(path: Path, state: dict) -> None:
+    """Write `state` to `path` as JSON via a temp file + rename.
+
+    Every HOOK that writes state.json goes through this (session_start,
+    track, token_tracker, stop_gate, on_idle.sh), so a hook killed mid-write leaves
+    the old file, never an empty or half-written one. The temp name carries
+    the PID, so two hooks writing at once never share a temp file.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = json.dumps(state, indent=2)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(data)
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def _now_utc() -> str:

@@ -79,14 +79,24 @@ with open('$PROMPT_FILE', 'w') as f:
 
 # ── Update state ──────────────────────────────────────────────────────────────
 
-python3 -c "
-import json
-with open('$STATE_FILE') as f:
-    s = json.load(f)
-s['idle_prompted'] = True
-with open('$STATE_FILE', 'w') as f:
-    json.dump(s, f, indent=2)
-" && log "State: idle_prompted=true" || log "Warning: could not update state"
+# Atomic write via _state.write_state_atomic, which must sit beside this
+# script: without it this logs a warning and idle_prompted stays unset, so the
+# idle prompt repeats. Paths travel as argv, not interpolated into the source.
+# `-I` keeps the working directory off sys.path; `python3 -c`, not a
+# here-document, because bash needs a writable temp dir for those.
+HOOKS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MARK_IDLE='
+import json, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from _state import write_state_atomic
+path = Path(sys.argv[2])
+s = json.loads(path.read_text())
+s["idle_prompted"] = True
+write_state_atomic(path, s)
+'
+python3 -I -c "$MARK_IDLE" "$HOOKS_DIR" "$STATE_FILE" \
+  && log "State: idle_prompted=true" || log "Warning: could not update state"
 
 # ── Desktop notification ──────────────────────────────────────────────────────
 # Surfaces outside the terminal so you notice even when Claude Code is in bg.
