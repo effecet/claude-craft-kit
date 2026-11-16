@@ -241,6 +241,20 @@ def test_timeout_is_errored(repo):
     assert "timed out after 3s" in r.stdout
 
 
+def _alive(pid: int) -> bool:
+    """True if `pid` exists and is not a zombie (Linux /proc; macOS reaps)."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    stat = Path(f"/proc/{pid}/stat")
+    try:
+        # field 3, after the parenthesised command name, is the state letter
+        return stat.read_text().rsplit(")", 1)[1].split()[0] != "Z"
+    except (FileNotFoundError, IndexError):
+        return not stat.parent.parent.exists()  # no /proc (macOS): trust kill
+
+
 def test_timeout_kills_what_pytest_spawned(repo, tmp_path):
     """A timeout kills pytest's whole process group, not just pytest."""
     pidfile = tmp_path / "child.pid"
@@ -255,12 +269,11 @@ def test_timeout_kills_what_pytest_spawned(repo, tmp_path):
     r = run(repo, m, extra=("--timeout", "10"))
     assert "timed out after 10s" in r.stdout, r.stdout + r.stderr
     pid = int(pidfile.read_text())
-    # The orphaned child is reaped by init, so it disappears; where nothing
-    # reaps orphans (a bare container PID 1), a zombie would fail this falsely.
+    # A killed child is gone once something reaps it. A container whose PID 1
+    # never reaps orphans (some self-hosted CI runners) leaves it a zombie:
+    # dead, but still answering os.kill(pid, 0). So a zombie counts as gone.
     for _ in range(50):
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
+        if not _alive(pid):
             return
         time.sleep(0.1)
     os.kill(pid, signal.SIGKILL)  # only here: the pid is known to be ours
