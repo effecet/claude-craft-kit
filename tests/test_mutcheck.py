@@ -275,8 +275,11 @@ def test_tb_styles_without_e_lines_are_refused(repo, tb):
 
 
 def test_relative_python_is_resolved_where_mutcheck_runs(repo):
+    # A wrapper, not a symlink: a symlink to a venv's python placed outside
+    # the venv no longer finds the venv's packages (pytest among them).
     link = repo.parent / "py"
-    link.symlink_to(sys.executable)
+    link.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
+    link.chmod(0o755)
     mfile = repo.parent / "mutants.toml"
     mfile.write_text(PLUS)
     r = subprocess.run(
