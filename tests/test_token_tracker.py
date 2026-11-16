@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+import _state
 import token_tracker as tt
 import track
 
@@ -218,7 +219,8 @@ def test_failed_write_keeps_the_old_state(
     def boom(*a, **k):
         raise OSError("disk full")
 
-    monkeypatch.setattr(mod.os, "replace", boom)
+    # Both route through the shared writer, so the rename to break is _state's.
+    monkeypatch.setattr(_state.os, "replace", boom)
     with pytest.raises(OSError):
         mod.write_state({"user_message_count": 8})
     assert json.loads(state_file.read_text()) == {"user_message_count": 7}

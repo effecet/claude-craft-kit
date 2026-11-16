@@ -25,7 +25,7 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
-from _state import make_fresh_state
+from _state import make_fresh_state, write_state_atomic
 from common import encode_project_path
 
 CLAUDE_DIR = Path(os.environ.get("CLAUDE_DIR", str(Path.home() / ".claude")))
@@ -179,16 +179,7 @@ def read_state() -> dict:
 
 
 def write_state(state: dict) -> None:
-    # Temp file + rename, so a kill mid-write never leaves an empty state.json.
-    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    data = json.dumps(state, indent=2)
-    tmp = STATE_FILE.with_name(f"{STATE_FILE.name}.{os.getpid()}.tmp")
-    try:
-        tmp.write_text(data)
-        os.replace(tmp, STATE_FILE)
-    except BaseException:
-        tmp.unlink(missing_ok=True)
-        raise
+    write_state_atomic(STATE_FILE, state)
 
 
 def _archive_and_reset_if_day_changed(state: dict) -> dict:

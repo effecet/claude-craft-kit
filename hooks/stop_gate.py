@@ -24,6 +24,16 @@ import subprocess
 import sys
 from pathlib import Path
 
+try:
+    from _state import write_state_atomic
+except ImportError:
+    # `make install` copies hooks/ whole, so _state.py always lands beside this
+    # file. Only this hook keeps a fallback for a hand-copied install: it is
+    # the one whose crash would cost the wrap-up reminder and the backup, where
+    # the others fail loudly and only lose a report or a nudge.
+    def write_state_atomic(path: Path, state: dict) -> None:  # type: ignore[misc]
+        path.write_text(json.dumps(state, indent=2))
+
 CLAUDE_DIR = Path(os.environ.get("CLAUDE_DIR", str(Path.home() / ".claude")))
 STATE_FILE = CLAUDE_DIR / "session/state.json"
 _backup_env = os.environ.get("BACKUP_SCRIPT", "")
@@ -101,7 +111,7 @@ def main() -> None:
     # the same day, so this fires at most once per day, not per session.
     state["stop_gate_prompted"] = True
     try:
-        STATE_FILE.write_text(json.dumps(state, indent=2))
+        write_state_atomic(STATE_FILE, state)
     except Exception:
         pass  # best-effort — a failed write costs one extra reminder, nothing more
     skill_path = CLAUDE_DIR / "skills/wrap-up/SKILL.md"

@@ -64,7 +64,7 @@ See **[docs/WORKFLOW.md](docs/WORKFLOW.md)** for the full walkthrough and the va
 | (gate) | `validate_tier.py` | Pick the review tier from diff size + sensitive paths |
 | Stop | `stop_gate.py` | Block a clean exit until wrap-up runs on substantial sessions |
 | idle | `on_idle.sh` | Nudge a wrap-up after inactivity |
-| helpers | `_state.py`, `common.py`, `shell_words.py`, `spec_audit.py` | Shared state schema, path helpers, shell-command parsing, spec reporting |
+| helpers | `_state.py`, `common.py`, `shell_words.py`, `spec_audit.py` | Shared state schema + atomic write, path helpers, shell-command parsing, spec reporting |
 
 **Rules** (`rules/`) — the behavior the hooks enforce: `development.md` (the
 validation gate + TDD), `operations.md` (proposal gate, git safety), `memory.md`,
@@ -163,7 +163,7 @@ claude-craft-kit/
 │   ├── ruff_workflow_guard.py  # PreToolUse: ruff before commit
 │   ├── on_idle.sh              # idle: wrap-up nudge
 │   ├── spec_audit.py           # report open specs
-│   ├── _state.py               # session-state schema
+│   ├── _state.py               # session-state schema + atomic state.json write
 │   ├── common.py               # path + connection-string helpers
 │   ├── shell_words.py          # shell-command parsing for hook_bypass_guard
 │   └── optional/               # backend-coupled, BRAIN_ENABLED=false by default
